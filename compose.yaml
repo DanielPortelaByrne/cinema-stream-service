@@ -1,0 +1,27 @@
+services:
+  stream-service:
+    build: .
+    image: cinema-stream-service:local
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    env_file: .env
+    environment:
+      LISTEN_HOST: 0.0.0.0
+      STREAM_PORT: "5057"
+      MEDIA_ROOT: /media
+      STATE_ROOT: /state
+    ports:
+      - "${STREAM_BIND_ADDRESS:-127.0.0.1}:${STREAM_PORT:-5057}:5057"
+    volumes:
+      - "${MEDIA_ROOT:-./media}:/media"
+      - "${STATE_ROOT:-./state}:/state"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256

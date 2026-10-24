@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!.dockerignore
+!stream_service.py
+!configuration.py
+!playback.py
+!LICENSE
