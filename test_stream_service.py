@@ -50,7 +50,7 @@ class SelectionRules(unittest.TestCase):
 
     def test_prefers_audio_the_tv_can_decode(self):
         eac3 = release('Backrooms 2026 1080p AMZN WEB-DL DDP5 1 Atmos H 264', seeders=800)
-        plain = release('Backrooms 2026 1080p WEB-DL HEVC x265 5.1 BONE', seeders=120)
+        plain = release('Backrooms 2026 1080p WEB-DL HEVC x265 5.1 BONE', seeders=500)
         self.assertTrue(svc.audio_unplayable(eac3['title']))
         self.assertFalse(svc.audio_unplayable(plain['title']))
         self.assertEqual(svc.pick([eac3, plain], 'Backrooms', 2026)['title'], plain['title'])
@@ -79,11 +79,19 @@ class EpisodeRules(unittest.TestCase):
         self.assertEqual(svc.acceptable(release('Westworld S01E08 1080p BluRay', size=1024 ** 3), self.SHOW, None, self.EP), (False, 'other episode'))
         self.assertEqual(svc.acceptable(release('Westworld S01E17 1080p BluRay', size=1024 ** 3), self.SHOW, None, self.EP), (False, 'other episode'))
 
-    def test_a_season_pack_is_refused(self):
+    def test_the_pack_of_that_season_is_accepted_but_not_other_seasons_or_several(self):
         pack = release('Westworld S01 Complete 1080p BluRay', size=8 * 1024 ** 3)
-        self.assertFalse(svc.acceptable(pack, self.SHOW, None, self.EP)[0])
+        self.assertTrue(svc.acceptable(pack, self.SHOW, None, self.EP)[0])
+        self.assertTrue(svc.acceptable(release('Westworld Season 1 1080p WEB-DL', size=8 * 1024 ** 3), self.SHOW, None, self.EP)[0])
+        self.assertEqual(svc.acceptable(release('Westworld S02 1080p BluRay', size=8 * 1024 ** 3), self.SHOW, None, self.EP), (False, 'other episode'))
         ranged = release('Westworld S01-S02 1080p BluRay S01E07', size=8 * 1024 ** 3)
-        self.assertEqual(svc.acceptable(ranged, self.SHOW, None, self.EP)[1], 'season pack')
+        self.assertEqual(svc.acceptable(ranged, self.SHOW, None, self.EP)[1], 'several seasons')
+        self.assertEqual(svc.acceptable(release('Westworld S01 Extras 1080p', size=8 * 1024 ** 3), self.SHOW, None, self.EP)[1], 'extras')
+
+    def test_a_pack_is_judged_by_one_episodes_share_of_it(self):
+        pack = release('Westworld S01 Complete 1080p BluRay', size=40 * 1024 ** 3)
+        single = release('Westworld S01E07 1080p BluRay', size=4 * 1024 ** 3)
+        self.assertAlmostEqual(svc.stream_score(pack, episode=self.EP), svc.stream_score(single, episode=self.EP))
 
     def test_episode_size_bounds_differ_from_films(self):
         small = release('Westworld S01E07 720p WEB-DL', size=40 * 1024 ** 2)
@@ -145,6 +153,10 @@ class FakeServers:
         class Prowlarr(BaseHTTPRequestHandler):
             def log_message(self, *_): pass
             def do_GET(self):
+                if self.path.startswith('/api/v1/indexer'):
+                    body = json.dumps([{'id': 1, 'enable': True}]).encode()
+                    self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+                    return
                 body = json.dumps([release('Heat 1995 1080p BluRay', seeders=40), release('Heat 1995 HDCAM', seeders=500)]).encode()
                 self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
 
@@ -246,7 +258,7 @@ class EndToEnd(unittest.TestCase):
         for server in self.fake.servers:
             self.addCleanup(server.server_close)
             self.addCleanup(server.shutdown)
-        self.streams = svc.Streams(prowlarr_api_key='testkey', prowlarr=self.fake.prowlarr, qbit=self.fake.qbit, seerr='http://127.0.0.1:1',
+        self.streams = svc.Streams(prowlarr_api_key='testkey', prowlarr=self.fake.prowlarr, qbit=self.fake.qbit, seerr='http://127.0.0.1:1', addons=(),
                                    host_media=self.host_media, qbit_media='/media')
 
     def test_start_selects_only_the_film_and_serves_it_with_ranges(self):

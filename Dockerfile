@@ -8,7 +8,7 @@ RUN apt-get update \
     && chown cinema:cinema /media /state
 
 WORKDIR /app
-COPY stream_service.py configuration.py playback.py LICENSE ./
+COPY stream_service.py configuration.py playback.py voice.py LICENSE ./
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 LISTEN_HOST=0.0.0.0 STREAM_PORT=5057 MEDIA_ROOT=/media STATE_ROOT=/state
 USER cinema
 EXPOSE 5057

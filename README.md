@@ -151,3 +151,33 @@ configuration, session expiry, movie/episode selection, sequential downloads, HT
 ownership and the API pattern used by both apps. No real indexer or torrent download is needed for the tests.
 
 Derived from the streaming backend in the original Android TV launcher project. MIT licensed; see [LICENSE](LICENSE).
+
+## Download by voice
+
+A Google Home routine, Home Assistant or IFTTT can ask for a film or series by sending the words it heard. The service
+searches Seerr, picks the best match and files the request, so Radarr or Sonarr and your torrent client do the rest.
+It is off unless `SEERR_API_KEY` and `VOICE_TOKEN` are both set in `.env`.
+
+```bash
+curl -X POST http://YOUR-SERVER:5057/voice/request \
+  -H "Authorization: Bearer YOUR_VOICE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"query": "download Dune Part Two"}'
+# {"status": "requested", "title": "Dune: Part Two (2024)", "say": "Requested Dune: Part Two (2024)."}
+```
+
+`status` is `requested`, `already` (asked for before), `available` (already in your library), `not_found`, `unclear`
+or `unavailable`; `say` is a sentence a speaker can read back. "the show ..." or "the movie ..." and a year ("Dune 2021")
+narrow the match. Series are requested for every season. At most 12 requests a minute. The token is the only guard, so keep
+the service on your LAN and never put the token in a public place.
+
+## How a release is chosen
+
+- **Sources.** Each enabled Prowlarr indexer is asked on its own, all at once, so one slow or broken indexer cannot hold up
+  the others. Two public Stremio add-ons (Torrentio and MediaFusion) are asked alongside them, and the torrents a Cinema
+  app sends as `candidates` (from the owner's own add-ons) join the pool. The add-ons see the title being searched for and
+  nothing else; set `STREAM_ADDONS=none` to use only your indexers.
+- **Episodes.** An episode's own release is preferred, but a pack of that season is accepted too (its size is shared over
+  about ten episodes when judging whether it can keep up). Packs of several seasons, extras and samples are refused.
+- **Pick.** It has to start quickly, so only releases with at least half the best seed count compete, and the best
+  quality among them wins. A bare info hash becomes a magnet with public trackers added so peers can be found.
+- **qBittorrent.** The service only adopts and deletes torrents in its own category (`STREAM_CATEGORY`).

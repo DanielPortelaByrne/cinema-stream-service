@@ -3,6 +3,7 @@
 
 POST /start   {"title": "...", "year": 1999}  -> {"path": "/stream/<hash>/<ticket>", "label": "...", "bytes": n}
 POST /prepare {"title": "...", "year": 1999}  -> 202 at once; searches in the background so a later /start is quick
+POST /voice/request {"query": "download dune part two"}  -> files a Seerr request (needs SEERR_API_KEY and VOICE_TOKEN)
 GET  /stream/<hash>/<ticket>                           -> the film's bytes, with Range support while it downloads
 GET  /health                                  -> {"ok": true}
 
@@ -12,8 +13,10 @@ sequential download, and only its film file is selected. The server reads that f
 No API keys or session cookies leave this process, and logs never include them.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait
 import datetime as dt
 import base64
+import hmac
 import http.cookiejar
 import json
 import logging
@@ -32,6 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from configuration import Settings
 from playback import PlaybackTickets
+from voice import Voice
 
 LOG = logging.getLogger('stream-service')
 HOST_MEDIA = Path('./media')
@@ -47,6 +51,7 @@ MIN_BYTES = 300 * 1024 * 1024
 MAX_BYTES = 12 * 1024 ** 3
 MIN_EPISODE_BYTES = 80 * 1024 * 1024    # an episode is far smaller than a film
 MAX_EPISODE_BYTES = 8 * 1024 ** 3
+MAX_BODY = 65536           # a request may carry up to 60 add-on candidates
 STALL_SECONDS = 60          # no new bytes for this long means the stream has stalled
 QUICK_POLL_SECONDS = 0.25   # how often a waiting stream checks for newly written bytes
 COPY_CHUNK_BYTES = 256 * 1024   # small enough to start sending sooner, large enough not to thrash the socket
@@ -55,6 +60,18 @@ FFMPEG = shutil.which('ffmpeg') or '/usr/bin/ffmpeg'
 IDLE_SECONDS = 4 * 3600     # an unwatched stream is removed after this long
 START_TIMEOUT = 90          # waiting for qBittorrent to fetch torrent metadata
 SEARCH_TTL = 20 * 60        # a search answer is reused this long (a /prepare, then the /start that follows it)
+INDEXER_SECONDS = 15        # one indexer that has not answered by now is skipped
+ADDON_SECONDS = 25          # a public Stremio add-on that has not answered by now is skipped
+SEARCH_SECONDS = 30         # the whole search gives up on the indexers still silent by then
+# Public Stremio add-ons that answer for anyone (no account, no configuration). Their streams come by info hash.
+# STREAM_ADDONS replaces this list (comma-separated base URLs); "none" turns the add-on lookup off.
+ADDONS = ('https://torrentio.strem.fun', 'https://mediafusion.elfhosted.com')
+CINEMETA = 'https://v3-cinemeta.strem.io'   # finds a title's IMDb id, which the add-ons key on
+# Public trackers added to a magnet made from an info hash, so the peers Stremio's add-ons use can be found too.
+TRACKERS = ('udp://tracker.opentrackr.org:1337/announce', 'udp://open.stealth.si:80/announce',
+            'udp://tracker.torrent.eu.org:451/announce', 'udp://exodus.desync.com:6969/announce',
+            'udp://open.demonii.com:1337/announce', 'udp://tracker.moeking.me:6969/announce',
+            'http://tracker.openbittorrent.com:80/announce')
 FILM_MINUTES = 110          # running times assumed when the request does not say
 EPISODE_MINUTES = 45
 MBPS_PER_SEEDER = 1.5       # roughly what one seeder sustains for a sequential download over a home line
@@ -67,6 +84,22 @@ SOURCES = (('remux', 2.0), ('bluray', 2.0), ('blu-ray', 2.0), ('web-dl', 2.0), (
 
 class ServiceError(Exception):
     pass
+
+
+def clean_candidates(raw):
+    """Torrents the owner's Stremio add-ons offered, as Cinema sends them. Anything not a well-formed torrent is dropped."""
+    if not isinstance(raw, list):
+        return []
+    kept = []
+    for item in raw[:60]:
+        if not isinstance(item, dict):
+            continue
+        info = str(item.get('infoHash', '')).lower()
+        seeders, size = item.get('seeders'), item.get('size')
+        if re.fullmatch(r'[0-9a-f]{40}', info) and type(seeders) is int and type(size) is int \
+                and 0 <= seeders < 10 ** 6 and 0 < size < 10 ** 12:
+            kept.append({'title': str(item.get('title', ''))[:300], 'infoHash': info, 'seeders': seeders, 'size': size})
+    return kept
 
 
 def normalize(text):
@@ -104,11 +137,32 @@ def title_matches(title, year, release):
     return True
 
 
+EPISODE_TAG = re.compile(r'(?<![a-z0-9])s\d{1,2}(?:e\d|(?![a-z0-9]))|(?<![a-z0-9])\d{1,2}x\d{2}|season\s*\d|complete', re.I)
+SHOW_QUALIFIERS = {'us'}   # "The Office US" is still The Office; "UK", "Netherlands" and the like are different shows
+
+
+def show_title_is(title, release):
+    """Whether the words before a release's season/episode tag are this show and no other ("... Netherlands" is another show)."""
+    tag = EPISODE_TAG.search(release or '')
+    head = normalize(release[:tag.start()] if tag else release).split()
+    while head and (head[-1] in SHOW_QUALIFIERS or re.fullmatch(r'(?:19|20)\d\d', head[-1])):
+        head.pop()
+    return head == normalize(title).split()
+
+
+PACK_EPISODES = 10   # a season pack's size is shared out over about this many episodes when judging its bitrate
+
+
+def season_pack(name, season):
+    """Whether a release name is a season's pack (S01 with no episode tag, or Season 1, or COMPLETE)."""
+    return re.search(r'(?<![a-z0-9])s0*%d(?![0-9e])|season\s*0*%d(?![0-9])|complete' % (season, season), name or '', re.I) is not None
+
+
 def acceptable(result, title, year, episode=None):
     """Whether a Prowlarr result is worth trying at all. Returns (keep, reason).
 
-    With episode = (season, episode) the result must be a single-episode release for that episode. A season pack
-    would need its file chosen per episode, which the server does not do, so packs are refused.
+    With episode = (season, episode) the result is that episode's own release, or a pack of the season that holds it. The
+    pack's episode file is chosen once its files are known. Packs of several seasons are refused.
     """
     name = result.get('title') or ''
     seeders = result.get('seeders')
@@ -116,17 +170,22 @@ def acceptable(result, title, year, episode=None):
     info = parse_release(name)
     if not isinstance(seeders, int) or seeders < MIN_SEEDERS:
         return False, 'seeders'
-    low, high = (MIN_BYTES, MAX_BYTES) if episode is None else (MIN_EPISODE_BYTES, MAX_EPISODE_BYTES)
+    pack = episode is not None and not episode_marker(*episode).search(name)
+    low, high = (MIN_BYTES, MAX_BYTES) if episode is None or pack else (MIN_EPISODE_BYTES, MAX_EPISODE_BYTES)
     if size < low or size > high:
         return False, 'size'
     if info['bad']:
         return False, 'poor copy'
     if info['multi_season']:
-        return False, 'not a film' if episode is None else 'season pack'
+        return False, 'not a film' if episode is None else 'several seasons'
     if episode is not None:
-        if not episode_marker(*episode).search(name):
+        if pack and not season_pack(name, episode[0]):
             return False, 'other episode'
-        if not title_matches(title, None, name):
+        if pack and re.search(r'extras?|bonus|featurette|sample|trailer', name, re.I):
+            return False, 'extras'
+        if not pack and not episode_marker(*episode).search(name):
+            return False, 'other episode'
+        if not title_matches(title, None, name) or not show_title_is(title, name):
             return False, 'title'
     elif not title_matches(title, year, name):
         return False, 'title'
@@ -171,17 +230,75 @@ def stream_score(result, runtime_minutes=None, episode=None, any_audio=False):
     source = dict(SOURCES).get(info['source'], 0.0)
     seeders = max(result.get('seeders') or 0, 1)
     minutes = runtime_minutes or (EPISODE_MINUTES if episode is not None else FILM_MINUTES)
-    mbps = (result.get('size') or 0) * 8 / (minutes * 60) / 1e6
+    size = result.get('size') or 0
+    if episode is not None and not episode_marker(*episode).search(result.get('title') or ''):
+        size /= PACK_EPISODES   # a season pack: one episode's share of it plays
+    mbps = size * 8 / (minutes * 60) / 1e6
     comfortable = seeders * MBPS_PER_SEEDER * STREAM_HEADROOM
     starved = 3.0 * math.log2(mbps / comfortable) if mbps > comfortable > 0 else 0.0
     silent = AUDIO_PENALTY if not any_audio and audio_unplayable(result.get('title')) else 0.0
     return resolution * 2 + source + 2 * math.log10(seeders) - starved - silent
 
 
+SEEDED_SHARE = 0.5   # the releases kept for quality are those with at least this share of the best seed count
+
+
 def pick(results, title, year, episode=None, runtime_minutes=None, any_audio=False):
-    """Best acceptable result to stream, or None."""
+    """Best acceptable result to stream, or None.
+
+    It must load first, so only the most seeded releases are considered (at least SEEDED_SHARE of the best seed count).
+    Among those, the highest quality wins.
+    """
     kept = [r for r in results if acceptable(r, title, year, episode)[0]]
-    return max(kept, key=lambda r: stream_score(r, runtime_minutes, episode, any_audio)) if kept else None
+    if not kept:
+        return None
+    best_seeds = max(int(r.get('seeders') or 0) for r in kept)
+    seeded = [r for r in kept if int(r.get('seeders') or 0) >= max(MIN_SEEDERS, best_seeds * SEEDED_SHARE)]
+    return max(seeded, key=lambda r: stream_score(r, runtime_minutes, episode, any_audio))
+
+
+imdb_ids = {}   # (cinemeta, title, year, kind) -> IMDb id, or None when Cinemeta has no such title
+
+
+def fetch_json(url, seconds):
+    with urllib.request.urlopen(urllib.request.Request(url, headers={'Accept': 'application/json'}), timeout=seconds) as response:
+        return json.loads(response.read() or b'{}')
+
+
+def imdb_id(title, year, kind, cinemeta=CINEMETA):
+    """The IMDb id of a film or series, found by its name on Cinemeta."""
+    key = (cinemeta, normalize(title), str(year or ''), kind)
+    if key not in imdb_ids:
+        found = None
+        for meta in fetch_json(f'{cinemeta}/catalog/{kind}/top/search={urllib.parse.quote(title)}.json', INDEXER_SECONDS).get('metas') or []:
+            same_year = not year or str(year) in str(meta.get('releaseInfo') or '')
+            if normalize(meta.get('name')) == normalize(title) and same_year:
+                found = meta.get('id')
+                break
+        imdb_ids[key] = found
+    return imdb_ids[key]
+
+
+def addon_results(base, title, year, episode, cinemeta=CINEMETA):
+    """One public Stremio add-on's streams for the title, in the same shape as a Prowlarr result."""
+    kind = 'movie' if episode is None else 'series'
+    imdb = imdb_id(title, year, kind, cinemeta)
+    if imdb is None:
+        return []
+    path = imdb if episode is None else '%s:%d:%d' % (imdb, int(episode[0]), int(episode[1]))
+    results = []
+    for stream in fetch_json(f'{base}/stream/{kind}/{path}.json', ADDON_SECONDS).get('streams') or []:
+        info = (stream.get('infoHash') or '').lower()
+        text = stream.get('title') or ''
+        name = text.split('\n')[0].strip()
+        seeds = re.search('\U0001F464\\s*(\\d+)', text)            # the person icon before the seeders
+        size = re.search('\U0001F4BE\\s*([\\d.,]+)\\s*(GB|MB)', text)   # the disc icon before the size
+        if not (re.fullmatch(r'[0-9a-f]{40}', info) and name and seeds and size):
+            continue
+        unit = 1024 ** 3 if size.group(2) == 'GB' else 1024 ** 2
+        results.append({'title': name, 'infoHash': info, 'seeders': int(seeds.group(1)),
+                        'size': int(float(size.group(1).replace(',', '.')) * unit)})
+    return results
 
 
 class SearchCache:
@@ -272,7 +389,8 @@ def magnet_for(result, title):
         return link  # Preserve tracker parameters, including those required by private trackers.
     info = (result.get('infoHash') or '').lower()
     if re.fullmatch(r'[0-9a-f]{40}', info):
-        return 'magnet:?xt=urn:btih:' + info + '&dn=' + urllib.parse.quote(title or '')
+        return ('magnet:?xt=urn:btih:' + info + '&dn=' + urllib.parse.quote(title or '')
+                + ''.join('&tr=' + urllib.parse.quote(tracker, safe='') for tracker in TRACKERS))
     return None
 
 
@@ -310,7 +428,10 @@ class Streams:
     """Turns a title into a torrent, keeps its film file known, and removes idle ones."""
 
     def __init__(self, *, prowlarr=PROWLARR, qbit=QBIT, seerr=SEERR, host_media=HOST_MEDIA, qbit_media=QBIT_MEDIA,
-                 prowlarr_api_key='', qbit_username='', qbit_password='', tickets=None):
+                 prowlarr_api_key='', qbit_username='', qbit_password='', tickets=None,
+                 category=CATEGORY, addons=ADDONS, cinemeta=CINEMETA):
+        self.category = category
+        self.addons, self.cinemeta = tuple(addons), cinemeta
         self.prowlarr_api_key = prowlarr_api_key
         self.qbit_username = qbit_username
         self.qbit_password = qbit_password
@@ -341,13 +462,45 @@ class Streams:
             text, category = (f'{title} {year}' if year else title), MOVIE_CATEGORY
         else:
             text, category = f'{title} S{int(episode[0]):02d}E{int(episode[1]):02d}', TV_CATEGORY
-        query = urllib.parse.urlencode({'query': text, 'type': 'search', 'categories': category, 'limit': 100})
-        req = urllib.request.Request(f'{self.prowlarr}/api/v1/search?{query}', headers={'X-Api-Key': key, 'Accept': 'application/json'})
+        headers = {'X-Api-Key': key, 'Accept': 'application/json'}
         try:
-            with urllib.request.urlopen(req, timeout=60) as response:
+            with urllib.request.urlopen(urllib.request.Request(f'{self.prowlarr}/api/v1/indexer', headers=headers), timeout=10) as response:
+                indexers = [i['id'] for i in json.loads(response.read() or b'[]') if i.get('enable')]
+        except (urllib.error.URLError, ValueError, OSError, KeyError, TypeError):
+            LOG.info('Prowlarr indexer list unavailable; asking the add-ons only')
+            indexers = []
+
+        # Each indexer is asked on its own and all at once. One that is slow or failing is skipped, so it cannot hold up
+        # the answers from the rest (Prowlarr otherwise waits for every indexer before it replies).
+        def ask(indexer):
+            query = urllib.parse.urlencode({'query': text, 'type': 'search', 'categories': category, 'limit': 100, 'indexerIds': indexer})
+            req = urllib.request.Request(f'{self.prowlarr}/api/v1/search?{query}', headers=headers)
+            with urllib.request.urlopen(req, timeout=INDEXER_SECONDS) as response:
                 return json.loads(response.read() or b'[]')
-        except (urllib.error.URLError, ValueError, OSError):
-            raise ServiceError('indexers unavailable') from None
+
+        def ask_addon(base):
+            return addon_results(base, title, year, episode, self.cinemeta)
+
+        workers = len(indexers) + len(self.addons)
+        if not workers:
+            raise ServiceError('indexers unavailable')
+        pool = ThreadPoolExecutor(max_workers=workers)
+        asked = {pool.submit(ask, i): f'indexer {i}' for i in indexers}
+        asked.update({pool.submit(ask_addon, base): base for base in self.addons})
+        done, late = wait(asked, timeout=SEARCH_SECONDS)
+        pool.shutdown(wait=False, cancel_futures=True)
+        results, answered = [], 0
+        for future in done:
+            try:
+                results.extend(future.result())
+                answered += 1
+            except (urllib.error.URLError, ValueError, OSError, TypeError, AttributeError):
+                LOG.info('%s failed, skipped', asked[future])
+        for future in late:
+            LOG.info('%s too slow, skipped', asked[future])
+        if not answered:
+            raise ServiceError('indexers unavailable')
+        return results
 
     # --- qBittorrent ------------------------------------------------------------------------------
 
@@ -383,7 +536,8 @@ class Streams:
                 raise ServiceError('qBittorrent credentials are not configured')
             try:
                 with send('/api/v2/auth/login', {'username': self.qbit_username, 'password': self.qbit_password}) as response:
-                    if response.read().strip() != b'Ok.':
+                    # Success is "Ok." on 4.x and an empty 204 on newer releases; anything else ("Fails.") is a refusal.
+                    if response.read().strip() not in (b'', b'Ok.'):
                         raise ServiceError('qBittorrent sign-in failed')
                 with send(path, form) as response:
                     return result(response)
@@ -410,7 +564,7 @@ class Streams:
 
     def restore(self):
         """After a restart, adopts stream torrents qBittorrent still holds, so their data is still served and swept."""
-        for row in self.qbit('/api/v2/torrents/info?category=' + CATEGORY) or []:
+        for row in self.qbit('/api/v2/torrents/info?category=' + self.category) or []:
             files = self.qbit('/api/v2/torrents/files?hash=' + row['hash']) or []
             chosen = video_file(files)
             if chosen is None:
@@ -458,7 +612,7 @@ class Streams:
         return rows[0] if rows else None
 
     def owns_torrent(self, row):
-        if not row or row.get('category') != CATEGORY:
+        if not row or row.get('category') != self.category:
             return False
         try:
             self.to_host(row.get('save_path', '')).relative_to(self.cache.resolve())
@@ -476,17 +630,17 @@ class Streams:
         with self.lock:
             if not self.qbit_ready:
                 categories = self.qbit('/api/v2/torrents/categories') or {}
-                if CATEGORY not in categories:
-                    self.qbit('/api/v2/torrents/createCategory', {'category': CATEGORY})
+                if self.category not in categories:
+                    self.qbit('/api/v2/torrents/createCategory', {'category': self.category})
                 self.qbit_ready = True
 
-    def start(self, title, year, episode=None, runtime_minutes=None, any_audio=False):
+    def start(self, title, year, episode=None, runtime_minutes=None, any_audio=False, candidates=()):
         """Finds the best copy and adds it to qBittorrent. Returns at once; the film's details arrive in the background.
 
         episode is (season, episode) for a TV episode, or None for a film.
         Returns (hash, label, phase) where phase is 'ready' or 'connecting'.
         """
-        results = self.searches.get(title, year, episode)
+        results = list(self.searches.get(title, year, episode)) + list(candidates)
         choice = pick(results, title, year, episode, runtime_minutes, any_audio)
         if choice is None:
             raise LookupError('no source')
@@ -508,7 +662,7 @@ class Streams:
                 raise ServiceError('This source already belongs to another download')
             self.ensure_category()
             self.qbit('/api/v2/torrents/add', {
-                'urls': link, 'savepath': self.to_qbit(self.cache), 'category': CATEGORY,
+                'urls': link, 'savepath': self.to_qbit(self.cache), 'category': self.category,
                 'sequentialDownload': 'true', 'firstLastPiecePrio': 'true', 'paused': 'false', 'stopped': 'false'})
         except ServiceError:
             with self.lock:
@@ -576,7 +730,7 @@ class Streams:
         with self.lock:
             episode = (self.pending.get(hash_) or {}).get('episode')
         while time.time() < deadline:
-            rows = self.qbit('/api/v2/torrents/info?category=' + CATEGORY) or []
+            rows = self.qbit('/api/v2/torrents/info?category=' + self.category) or []
             row = next((r for r in rows if hash_ and r.get('hash') == hash_), None)
             if row is None and not hash_ and rows:
                 row = max(rows, key=lambda r: r.get('added_on', 0))
@@ -646,11 +800,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def discard_body(self):
+        """Reads and drops an unwanted request body, so replying early does not reset the client's connection."""
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            return
+        if 0 < length <= MAX_BODY:
+            self.rfile.read(length)
+
     def authenticate(self):
         """Same Seerr sign-in the request pipeline uses: only household members with a Seerr account can start a stream."""
         cookie = self.headers.get('Cookie', '')
         if len(cookie) > 8192 or not re.search(r'(?:^|;\s*)connect\.sid=', cookie):
             LOG.info('start rejected: no Seerr session cookie sent')
+            self.discard_body()
             self.reply(401, {'error': 'Sign in to Seerr'})
             return False
         try:
@@ -660,6 +824,7 @@ class Handler(BaseHTTPRequestHandler):
         except (urllib.error.URLError, ValueError, OSError):
             user = {}
         if not user.get('id'):
+            self.discard_body()
             self.reply(401, {'error': 'Sign in to Seerr'})
             return False
         return True
@@ -690,8 +855,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(400, {'error': 'Invalid Content-Length'})
             self.close_connection = True
             return None
-        if not 0 < length <= 4096:
-            self.reply(413 if length > 4096 else 400, {'error': 'Request body must be between 1 and 4096 bytes'})
+        if not 0 < length <= MAX_BODY:
+            self.reply(413 if length > MAX_BODY else 400, {'error': 'Request body must be between 1 and %d bytes' % MAX_BODY})
             self.close_connection = True
             return None
         try:
@@ -717,9 +882,40 @@ class Handler(BaseHTTPRequestHandler):
         runtime = body.get('runtime')
         runtime = runtime if isinstance(runtime, int) and 0 < runtime < 1000 else None
         self.any_audio = body.get('audio') == 'any'
+        self.candidates = clean_candidates(body.get('candidates'))
         return title, (year if year.isdigit() else None), episode_key, runtime
 
+    def voice_request(self):
+        """A spoken "download X" from a routine. Off unless SEERR_API_KEY and VOICE_TOKEN are set; the token is its only guard."""
+        voice = getattr(self.server, 'voice', None)
+        if voice is None:
+            self.reply(404, {'error': 'Not found'})
+            return
+        given = self.headers.get('Authorization', '')
+        if not hmac.compare_digest(given.encode(), ('Bearer ' + self.server.voice_token).encode()):
+            LOG.info('voice rejected: wrong or missing token')
+            self.reply(401, {'error': 'Unauthorized', 'say': 'That was not allowed.'})
+            return
+        if not voice.allow():
+            self.reply(429, {'error': 'Too many requests', 'say': 'Too many requests, try again in a minute.'})
+            return
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            body = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else None
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        query = body.get('query') if isinstance(body, dict) else None
+        if not isinstance(query, str) or not query.strip():
+            self.reply(400, {'error': 'Send {"query": "what to download"}', 'say': "I didn't catch what to download."})
+            return
+        answer = voice.request(query)
+        LOG.info('voice request: %s (%s)', answer.get('title') or '-', answer['status'])
+        self.reply(200 if answer['status'] != 'unavailable' else 502, answer)
+
     def do_POST(self):
+        if self.path == '/voice/request':
+            self.voice_request()
+            return
         if self.path not in ('/start', '/prepare'):
             self.reply(404, {'error': 'Not found'})
             return
@@ -737,7 +933,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(202, {'ok': True, 'searching': searching})
                 return
             started = time.time()
-            hash_, label, phase = self.server.streams.start(title, year, episode_key, runtime, getattr(self, 'any_audio', False))
+            hash_, label, phase = self.server.streams.start(title, year, episode_key, runtime, getattr(self, 'any_audio', False),
+                                                            getattr(self, 'candidates', []))
             LOG.info('start %s: %r %s %s in %.1fs as %s', phase, title, year, episode_key or '', time.time() - started, label)
             self.reply(200, {'path': '/stream/' + hash_ + '/' + self.server.streams.tickets.issue(hash_), 'label': label, 'phase': phase})
         except LookupError as error:
@@ -901,6 +1098,8 @@ class Handler(BaseHTTPRequestHandler):
 
 class LimitedServer(ThreadingHTTPServer):
     daemon_threads = True
+    voice = None
+    voice_token = ''
 
 
 def main():
@@ -918,7 +1117,8 @@ def main():
         streams = Streams(prowlarr=config.prowlarr_url, prowlarr_api_key=config.prowlarr_api_key,
                           qbit=config.qbit_url, qbit_username=config.qbit_username, qbit_password=config.qbit_password,
                           seerr=config.seerr_url, host_media=config.media_root, qbit_media=config.qbit_media_root,
-                          tickets=tickets)
+                          tickets=tickets, category=config.category,
+                          addons=ADDONS if config.addons is None else config.addons)
     except (ValueError, OSError) as error:
         parser.exit(2, f'Configuration error: {error}\n')
 
@@ -939,6 +1139,9 @@ def main():
     threading.Thread(target=housekeeping, daemon=True).start()
     server = LimitedServer((config.listen_host, config.port), Handler)
     server.streams = streams
+    if config.seerr_api_key and config.voice_token:
+        server.voice, server.voice_token = Voice(config.seerr_url, config.seerr_api_key), config.voice_token
+        LOG.info('voice requests are on')
     server.serve_forever()
 
 

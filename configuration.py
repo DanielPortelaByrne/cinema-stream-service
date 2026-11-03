@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 import urllib.parse
 
 
@@ -42,6 +43,13 @@ class Settings:
     state_root: Path
     listen_host: str
     port: int
+    # Both are optional. The voice endpoint is switched on only when both are set.
+    seerr_api_key: str = field(default='', repr=False)
+    voice_token: str = field(default='', repr=False)
+    # The qBittorrent category this service owns: it only ever adopts and deletes torrents in it.
+    category: str = 'cinema-stream'
+    # Stremio add-on base URLs asked alongside Prowlarr. None means the built-in public ones; () turns them off.
+    addons: tuple = None
 
     @classmethod
     def from_env(cls, env=None):
@@ -52,6 +60,16 @@ class Settings:
         for name, value in (('PROWLARR_API_KEY', key), ('QBITTORRENT_USERNAME', username), ('QBITTORRENT_PASSWORD', password)):
             if not value:
                 raise ValueError(f'{name} (or {name}_FILE) is required')
+        voice_token = secret(env, 'VOICE_TOKEN')
+        if voice_token and len(voice_token) < 24:
+            raise ValueError('VOICE_TOKEN must be at least 24 characters (it is the only thing guarding the voice endpoint)')
+        category = env.get('STREAM_CATEGORY', 'cinema-stream').strip()
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', category):
+            raise ValueError('STREAM_CATEGORY must be 1 to 40 letters, digits, - or _')
+        addons = None
+        if 'STREAM_ADDONS' in env:
+            listed = [part.strip() for part in env['STREAM_ADDONS'].split(',') if part.strip()]
+            addons = () if listed == ['none'] or not listed else tuple(endpoint({'A': part}, 'A', '') for part in listed)
         media = env.get('QBITTORRENT_MEDIA_ROOT', '/media').rstrip('/')
         if not media.startswith('/') or media == '' or '\\' in media or '..' in media.split('/'):
             raise ValueError('QBITTORRENT_MEDIA_ROOT must be an absolute POSIX directory')
@@ -67,4 +85,5 @@ class Settings:
             endpoint(env, 'SEERR_URL', 'http://127.0.0.1:5055'),
             Path(env.get('MEDIA_ROOT', './media')).resolve(), media,
             Path(env.get('STATE_ROOT', './state')).resolve(), env.get('LISTEN_HOST', '127.0.0.1'), port,
+            secret(env, 'SEERR_API_KEY'), voice_token, category, addons,
         )

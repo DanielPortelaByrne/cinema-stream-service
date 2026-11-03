@@ -112,11 +112,29 @@ class UpstreamTests(LocalServerTests):
         self.assertIsNone(streams.qbit('/api/v2/torrents/add', {'urls': 'fixture'}))
         self.assertEqual(len(logins), 1)
 
+    def test_a_204_empty_login_reply_is_a_success(self):
+        """Newer qBittorrent answers a good login with 204 and no body, not "Ok.". """
+        logins = []
+        class Qbit(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_GET(self):
+                if self.headers.get('Cookie') != 'SID=fixture':
+                    self.send_response(403); self.end_headers(); return
+                self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'[]')
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                logins.append(self.path)
+                self.send_response(204); self.send_header('Set-Cookie', 'SID=fixture; Path=/'); self.end_headers()
+        _, base = self.serve(Qbit)
+        streams = svc.Streams(qbit=base, qbit_username='someone', qbit_password='fixture-password', host_media=self.temporary())
+        self.assertEqual(streams.qbit('/api/v2/torrents/info'), [])
+        self.assertEqual(len(logins), 1)
+
     def test_qbittorrent_http_200_login_failure_is_rejected(self):
         class Qbit(BaseHTTPRequestHandler):
             def log_message(self, *_): pass
             def do_GET(self): self.send_response(403); self.end_headers()
-            def do_POST(self): self.send_response(200); self.end_headers(); self.wfile.write(b'Fails.')
+            def do_POST(self): self.send_response(200); self.send_header('Content-Length', '6'); self.end_headers(); self.wfile.write(b'Fails.')
         _, base = self.serve(Qbit)
         streams = svc.Streams(qbit=base, qbit_username='someone', qbit_password='fixture-password', host_media=self.temporary())
         with self.assertRaisesRegex(svc.ServiceError, 'sign-in failed'):
@@ -128,12 +146,13 @@ class UpstreamTests(LocalServerTests):
             def log_message(self, *_): pass
             def do_GET(self):
                 observed.append((self.headers.get('X-Api-Key'), self.path))
-                self.send_response(200); self.end_headers(); self.wfile.write(b'[]')
+                self.send_response(200); self.end_headers()
+                self.wfile.write(b'[{"id": 1, "enable": true}]' if self.path.startswith('/api/v1/indexer') else b'[]')
         _, base = self.serve(Prowlarr)
-        streams = svc.Streams(prowlarr=base, prowlarr_api_key='fixture-key', host_media=self.temporary())
+        streams = svc.Streams(prowlarr=base, prowlarr_api_key='fixture-key', host_media=self.temporary(), addons=())
         self.assertEqual(streams.search('Example Film', 2026), [])
-        self.assertEqual(observed[0][0], 'fixture-key')
-        self.assertNotIn('fixture-key', observed[0][1])
+        self.assertEqual({key for key, _ in observed}, {'fixture-key'})
+        self.assertTrue(all('fixture-key' not in path for _, path in observed))
 
 
 class HttpContractTests(LocalServerTests):
@@ -208,7 +227,7 @@ class HttpContractTests(LocalServerTests):
             error.exception.close()
 
     def test_invalid_request_bodies_return_client_errors_without_starting(self):
-        for body, expected in ((b'[]', 400), (b'invalid', 400), (b'x' * 4097, 413),
+        for body, expected in ((b'[]', 400), (b'invalid', 400), (b'x' * 65537, 413),
                                ({'title': 'Example', 'season': True, 'episode': 1}, 400)):
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.post(body)
