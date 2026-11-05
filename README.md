@@ -180,4 +180,10 @@ the service on your LAN and never put the token in a public place.
   about ten episodes when judging whether it can keep up). Packs of several seasons, extras and samples are refused.
 - **Pick.** It has to start quickly, so only releases with at least half the best seed count compete, and the best
   quality among them wins. A bare info hash becomes a magnet with public trackers added so peers can be found.
+- **Streaming engine.** With `STREMIO_SERVER` set to Stremio's streaming server (for example
+  `podman run -d -p 11470:11470 docker.io/stremio/server`), streams play through Stremio's own torrent engine, which
+  downloads the pieces the player is waiting for first: the start, the seek index at the end, wherever it seeks. The
+  best three sources are opened at once and the best-ranked one that delivers its first 2 MiB within a few seconds
+  plays, so a release that advertises seeders but sends nothing is never chosen. Reads pass through this service, so
+  playback links and tickets are unchanged. Without it, streams use qBittorrent's sequential download below.
 - **qBittorrent.** The service only adopts and deletes torrents in its own category (`STREAM_CATEGORY`).

@@ -227,7 +227,7 @@ class HttpContractTests(LocalServerTests):
             error.exception.close()
 
     def test_invalid_request_bodies_return_client_errors_without_starting(self):
-        for body, expected in ((b'[]', 400), (b'invalid', 400), (b'x' * 65537, 413),
+        for body, expected in ((b'[]', 400), (b'invalid', 400), (b'x' * (svc.MAX_BODY + 1), 413),
                                ({'title': 'Example', 'season': True, 'episode': 1}, 400)):
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.post(body)

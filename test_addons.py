@@ -106,7 +106,7 @@ class AddonResults(unittest.TestCase):
         fake = FakeStremio(self, self.STREAMS)
         found = svc.addon_results(fake.url, 'Heat', 1995, None, fake.url)
         self.assertEqual([(r['infoHash'], r['seeders'], r['size']) for r in found],
-                         [(H1, 87, int(2.5 * 1024 ** 3)), (H2, 12, 900 * 1024 ** 2)])
+                         [(H1, 87, int(2.5 * 1024 ** 3)), (H2, 12, 900 * 1024 ** 2), (H3, None, 1024 ** 3)])
         self.assertTrue(any(p.startswith('/stream/movie/tt0113277') for p in fake.paths))   # the 1995 one, not the 2013 one
 
     def test_an_episode_is_asked_for_by_season_and_episode(self):

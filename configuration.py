@@ -50,6 +50,8 @@ class Settings:
     category: str = 'cinema-stream'
     # Stremio add-on base URLs asked alongside Prowlarr. None means the built-in public ones; () turns them off.
     addons: tuple = None
+    # Stremio's streaming server (for example the stremio/server container). Empty: streams use qBittorrent.
+    stremio_server: str = ''
 
     @classmethod
     def from_env(cls, env=None):
@@ -86,4 +88,5 @@ class Settings:
             Path(env.get('MEDIA_ROOT', './media')).resolve(), media,
             Path(env.get('STATE_ROOT', './state')).resolve(), env.get('LISTEN_HOST', '127.0.0.1'), port,
             secret(env, 'SEERR_API_KEY'), voice_token, category, addons,
+            endpoint(env, 'STREMIO_SERVER', '') if env.get('STREMIO_SERVER', '').strip() else '',
         )

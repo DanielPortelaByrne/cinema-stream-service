@@ -246,7 +246,8 @@ class StatusFields(unittest.TestCase):
         self.streams.downloaded_until = lambda entry, start: 0
         status = self.streams.status(HASH)
         self.assertEqual(status['phase'], 'buffering')
-        self.assertEqual((status['speed'], status['size'], status['progress']), (2_400_000, 900, 0.25))
+        self.assertEqual((status['speed'], status['size'], status['progress']), (2_400_000, 900, 0.0))
+        self.assertEqual(status['torrentProgress'], 0.25)
 
 
 class EndToEnd(unittest.TestCase):

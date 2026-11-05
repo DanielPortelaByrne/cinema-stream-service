@@ -34,6 +34,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from configuration import Settings
+from engine import EngineError, StremioEngine, sources_for
 from playback import PlaybackTickets
 from voice import Voice
 
@@ -51,15 +52,21 @@ MIN_BYTES = 300 * 1024 * 1024
 MAX_BYTES = 12 * 1024 ** 3
 MIN_EPISODE_BYTES = 80 * 1024 * 1024    # an episode is far smaller than a film
 MAX_EPISODE_BYTES = 8 * 1024 ** 3
-MAX_BODY = 65536           # a request may carry up to 60 add-on candidates
+MAX_BODY = 512 * 1024      # up to 60 candidates, now including file indexes and tracker hints
 STALL_SECONDS = 60          # no new bytes for this long means the stream has stalled
 QUICK_POLL_SECONDS = 0.25   # how often a waiting stream checks for newly written bytes
 COPY_CHUNK_BYTES = 256 * 1024   # small enough to start sending sooner, large enough not to thrash the socket
 READY_BYTES = 16 * 1024 * 1024  # how much must be ready before the loading screen hands over to playback
 FFMPEG = shutil.which('ffmpeg') or '/usr/bin/ffmpeg'
 IDLE_SECONDS = 4 * 3600     # an unwatched stream is removed after this long
-START_TIMEOUT = 90          # waiting for qBittorrent to fetch torrent metadata
+RACE_CANDIDATES = 3          # the best sources tried at once in the streaming engine; the first to deliver plays
+RACE_HEAD_BYTES = 2 * 1024 * 1024   # what each must deliver to count as alive (the player needs it first anyway)
+RACE_PATIENCE_SECONDS = 4    # how long the best-ranked source gets before a faster lower-ranked one is taken
+RACE_DEADLINE_SECONDS = 30   # no source delivered by then: none of them is playable now
+END_PIECE_RETRY_SECONDS = (2, 4, 8)  # re-apply first/last-piece priority after qBittorrent applies a file selection
+START_TIMEOUT = 90         # waiting for qBittorrent to fetch torrent metadata
 SEARCH_TTL = 20 * 60        # a search answer is reused this long (a /prepare, then the /start that follows it)
+SOURCE_FAILURE_TTL = 5 * 60  # avoid immediately selecting the same failed metadata source on retry
 INDEXER_SECONDS = 15        # one indexer that has not answered by now is skipped
 ADDON_SECONDS = 25          # a public Stremio add-on that has not answered by now is skipped
 SEARCH_SECONDS = 30         # the whole search gives up on the indexers still silent by then
@@ -96,9 +103,27 @@ def clean_candidates(raw):
             continue
         info = str(item.get('infoHash', '')).lower()
         seeders, size = item.get('seeders'), item.get('size')
-        if re.fullmatch(r'[0-9a-f]{40}', info) and type(seeders) is int and type(size) is int \
-                and 0 <= seeders < 10 ** 6 and 0 < size < 10 ** 12:
-            kept.append({'title': str(item.get('title', ''))[:300], 'infoHash': info, 'seeders': seeders, 'size': size})
+        if not re.fullmatch(r'[0-9a-f]{40}', info):
+            continue
+        if seeders is not None and (type(seeders) is not int or not 0 <= seeders < 10 ** 6):
+            continue
+        if size is not None and (type(size) is not int or not 0 < size < 10 ** 12):
+            continue
+        idx = item.get('fileIdx')
+        if idx is not None and (type(idx) is not int or not 0 <= idx <= 65535):
+            continue
+        candidate = {'title': str(item.get('title', ''))[:300], 'infoHash': info, 'seeders': seeders, 'size': size}
+        if seeders is None or size is None:
+            candidate['_addon'] = True  # missing display metadata is not evidence of a dead torrent
+        if idx is not None:
+            candidate['fileIdx'] = idx
+        sources = item.get('sources')
+        if isinstance(sources, list):
+            sources = [s for s in sources[:32] if isinstance(s, str) and len(s) <= 2048
+                       and s.startswith(('tracker:http://', 'tracker:https://', 'tracker:udp://', 'dht:'))]
+            if sources:
+                candidate['sources'] = sources
+        kept.append(candidate)
     return kept
 
 
@@ -168,11 +193,13 @@ def acceptable(result, title, year, episode=None):
     seeders = result.get('seeders')
     size = result.get('size') or 0
     info = parse_release(name)
-    if not isinstance(seeders, int) or seeders < MIN_SEEDERS:
+    if not (seeders is None and result.get('_addon')) and (not isinstance(seeders, int) or seeders < MIN_SEEDERS):
         return False, 'seeders'
     pack = episode is not None and not episode_marker(*episode).search(name)
-    low, high = (MIN_BYTES, MAX_BYTES) if episode is None or pack else (MIN_EPISODE_BYTES, MAX_EPISODE_BYTES)
-    if size < low or size > high:
+    low, high = ((MIN_BYTES, MAX_BYTES) if episode is None else
+                 (MIN_EPISODE_BYTES, MAX_EPISODE_BYTES * PACK_EPISODES) if pack else
+                 (MIN_EPISODE_BYTES, MAX_EPISODE_BYTES))
+    if not (result.get('size') is None and result.get('_addon')) and (size < low or size > high):
         return False, 'size'
     if info['bad']:
         return False, 'poor copy'
@@ -249,12 +276,22 @@ def pick(results, title, year, episode=None, runtime_minutes=None, any_audio=Fal
     It must load first, so only the most seeded releases are considered (at least SEEDED_SHARE of the best seed count).
     Among those, the highest quality wins.
     """
+    options = ranked(results, title, year, episode, runtime_minutes, any_audio)
+    return options[0] if options else None
+
+
+def ranked(results, title, year, episode=None, runtime_minutes=None, any_audio=False):
+    """Acceptable results, best first: the well seeded ones by quality (as pick() chooses), then the rest by quality."""
     kept = [r for r in results if acceptable(r, title, year, episode)[0]]
     if not kept:
-        return None
+        return []
     best_seeds = max(int(r.get('seeders') or 0) for r in kept)
     seeded = [r for r in kept if int(r.get('seeders') or 0) >= max(MIN_SEEDERS, best_seeds * SEEDED_SHARE)]
-    return max(seeded, key=lambda r: stream_score(r, runtime_minutes, episode, any_audio))
+    if not seeded:
+        seeded = kept  # add-ons may omit seeder counts entirely
+    score = lambda r: stream_score(r, runtime_minutes, episode, any_audio)
+    rest = [r for r in kept if not any(r is s for s in seeded)]
+    return sorted(seeded, key=score, reverse=True) + sorted(rest, key=score, reverse=True)
 
 
 imdb_ids = {}   # (cinemeta, title, year, kind) -> IMDb id, or None when Cinemeta has no such title
@@ -289,15 +326,20 @@ def addon_results(base, title, year, episode, cinemeta=CINEMETA):
     results = []
     for stream in fetch_json(f'{base}/stream/{kind}/{path}.json', ADDON_SECONDS).get('streams') or []:
         info = (stream.get('infoHash') or '').lower()
-        text = stream.get('title') or ''
-        name = text.split('\n')[0].strip()
-        seeds = re.search('\U0001F464\\s*(\\d+)', text)            # the person icon before the seeders
-        size = re.search('\U0001F4BE\\s*([\\d.,]+)\\s*(GB|MB)', text)   # the disc icon before the size
-        if not (re.fullmatch(r'[0-9a-f]{40}', info) and name and seeds and size):
+        text = stream.get('description') or stream.get('title') or ''
+        hints = stream.get('behaviorHints') or {}
+        name = hints.get('filename') or text.split('\n')[0].strip()
+        seeds = re.search(r'(?:👤|👥|[Ss]eeders?\s*:)\s*([\d,]+)', text)
+        size = re.search(r'💾\s*([\d.,]+)\s*(GiB|MiB|GB|MB)', text, re.I)
+        if not name:
             continue
-        unit = 1024 ** 3 if size.group(2) == 'GB' else 1024 ** 2
-        results.append({'title': name, 'infoHash': info, 'seeders': int(seeds.group(1)),
-                        'size': int(float(size.group(1).replace(',', '.')) * unit)})
+        unit = 1024 ** 3 if size and size.group(2).lower().startswith('g') else 1024 ** 2
+        results.extend(clean_candidates([{
+            'title': name, 'infoHash': info,
+            'seeders': stream.get('seeders', int(seeds.group(1).replace(',', '')) if seeds else None),
+            'size': hints.get('videoSize') or (int(float(size.group(1).replace(',', '.')) * unit) if size else None),
+            'fileIdx': stream.get('fileIdx'), 'sources': stream.get('sources'),
+        }]))
     return results
 
 
@@ -389,17 +431,27 @@ def magnet_for(result, title):
         return link  # Preserve tracker parameters, including those required by private trackers.
     info = (result.get('infoHash') or '').lower()
     if re.fullmatch(r'[0-9a-f]{40}', info):
+        trackers = [s[len('tracker:'):] for s in result.get('sources', []) if s.startswith('tracker:')]
         return ('magnet:?xt=urn:btih:' + info + '&dn=' + urllib.parse.quote(title or '')
-                + ''.join('&tr=' + urllib.parse.quote(tracker, safe='') for tracker in TRACKERS))
+                + ''.join('&tr=' + urllib.parse.quote(tracker, safe='') for tracker in dict.fromkeys(trackers or TRACKERS)))
     return None
 
 
-def video_file(files, episode=None):
+def video_file(files, episode=None, file_idx=None):
     """The largest video file in a torrent, as (index, name, size), or None.
 
     With episode = (season, episode), only a video file carrying that episode's SxxExx tag counts.
     """
     marker = episode_marker(*episode) if episode is not None else None
+    if file_idx is not None:
+        # The add-on selected this file for this exact video ID. A missing index must never become a different file.
+        selected = next((f for f in files if f.get('index') == file_idx), None)
+        if not selected or not selected.get('name', '').lower().endswith(VIDEO_EXTENSIONS):
+            return None
+        name = selected['name']
+        if marker and re.search(r's\d+e\d+', name, re.I) and not marker.search(name):
+            return None
+        return file_idx, name, selected.get('size', 0)
     videos = [(f.get('index'), f.get('name', ''), f.get('size', 0)) for f in files
               if f.get('name', '').lower().endswith(VIDEO_EXTENSIONS) and (marker is None or marker.search(f.get('name', '')))]
     return max(videos, key=lambda v: v[2]) if videos else None
@@ -429,7 +481,10 @@ class Streams:
 
     def __init__(self, *, prowlarr=PROWLARR, qbit=QBIT, seerr=SEERR, host_media=HOST_MEDIA, qbit_media=QBIT_MEDIA,
                  prowlarr_api_key='', qbit_username='', qbit_password='', tickets=None,
-                 category=CATEGORY, addons=ADDONS, cinemeta=CINEMETA):
+                 category=CATEGORY, addons=ADDONS, cinemeta=CINEMETA, engine=None):
+        # Stremio's streaming server, when set up: streams play through it; qBittorrent is then only the fallback.
+        self.engine = engine
+        self.race_patience, self.race_deadline = RACE_PATIENCE_SECONDS, RACE_DEADLINE_SECONDS
         self.category = category
         self.addons, self.cinemeta = tuple(addons), cinemeta
         self.prowlarr_api_key = prowlarr_api_key
@@ -449,6 +504,7 @@ class Streams:
         self.jar = http.cookiejar.CookieJar()
         self.client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
         self.qbit_ready = False
+        self.end_piece_retries = END_PIECE_RETRY_SECONDS
         self.pending = {}   # hash -> {"label", "error"} for films whose metadata has not arrived yet
         self.searches = SearchCache(lambda title, year, episode: self.search(title, year, episode))
 
@@ -566,7 +622,8 @@ class Streams:
         """After a restart, adopts stream torrents qBittorrent still holds, so their data is still served and swept."""
         for row in self.qbit('/api/v2/torrents/info?category=' + self.category) or []:
             files = self.qbit('/api/v2/torrents/files?hash=' + row['hash']) or []
-            chosen = video_file(files)
+            selected = [f for f in files if f.get('priority', 1) > 0]
+            chosen = video_file(selected)
             if chosen is None:
                 continue
             self.known[row['hash']] = self.entry_for(row['hash'], row['save_path'], files, chosen)
@@ -584,7 +641,8 @@ class Streams:
         except ValueError:
             raise ServiceError('video is outside the stream cache') from None
         return {
-            'hash': hash_, 'path': str(path), 'size': size, 'label': label,
+            'hash': hash_, 'path': str(path), 'size': size, 'label': label, 'file_index': index,
+            'advertised_seeders': (self.pending.get(hash_) or {}).get('advertised_seeders'),
             'offset': sum(f.get('size', 0) for f in files if f.get('index', 0) < index),
             'piece_size': props.get('piece_size') or 262144, 'pieces': [], 'pieces_at': 0.0, 'seen': time.time(),
             # Audio this TV cannot decode is converted to AAC while it is served; video is copied untouched.
@@ -640,7 +698,19 @@ class Streams:
         episode is (season, episode) for a TV episode, or None for a film.
         Returns (hash, label, phase) where phase is 'ready' or 'connecting'.
         """
-        results = list(self.searches.get(title, year, episode)) + list(candidates)
+        try:
+            results = list(self.searches.get(title, year, episode))
+        except ServiceError:
+            if not candidates:
+                raise
+            results = []  # the owner's add-ons remain usable when the backend's indexers are down
+        results += list(candidates)
+        with self.lock:
+            failed = {h for h, pending in self.pending.items() if pending['error'] and
+                      time.monotonic() - pending.get('failed_at', time.monotonic()) < SOURCE_FAILURE_TTL}
+        results = [r for r in results if hash_from_magnet(magnet_for(r, title)) not in failed]
+        if self.engine is not None:
+            return self.start_engine(results, title, year, episode, runtime_minutes, any_audio)
         choice = pick(results, title, year, episode, runtime_minutes, any_audio)
         if choice is None:
             raise LookupError('no source')
@@ -650,12 +720,25 @@ class Streams:
         hash_ = hash_from_magnet(link)
         label = re.sub(r'[\._]+', ' ', choice.get('title') or title)[:120]
         with self.lock:
-            if hash_ in self.known:
-                self.known[hash_]['seen'] = time.time()
-                return hash_, self.known[hash_]['label'], 'ready'
+            entry = self.known.get(hash_)
+            other_file = entry is not None and (
+                (choice.get('fileIdx') is not None and choice['fileIdx'] != entry.get('file_index')) or
+                (episode is not None and choice.get('fileIdx') is None and not episode_marker(*episode).search(entry['path'])))
+            if entry is not None and not other_file:
+                entry['seen'] = time.time()
+                return hash_, entry['label'], 'ready'
+        if other_file:
+            # Another episode of a season pack that is already here: point the torrent at that file.
+            entry = self.switch_file(hash_, episode, choice.get('fileIdx'))
+            return hash_, entry['label'], 'ready'
+        with self.lock:
             if hash_ in self.pending and not self.pending[hash_]['error']:
+                pending = self.pending[hash_]
+                if pending.get('episode') != episode or pending.get('fileIdx') != choice.get('fileIdx'):
+                    raise ServiceError('Another file in this torrent is already connecting')
                 return hash_, self.pending[hash_]['label'], 'connecting'
-            self.pending[hash_] = {'label': label, 'error': None, 'episode': episode}
+            self.pending[hash_] = {'label': label, 'error': None, 'episode': episode, 'fileIdx': choice.get('fileIdx'),
+                                   'advertised_seeders': choice.get('seeders')}
         try:
             existing = self.torrent(hash_)
             if existing and not self.owns_torrent(existing):
@@ -671,6 +754,127 @@ class Streams:
         threading.Thread(target=self.resolve, args=(hash_,), daemon=True).start()
         return hash_, label, 'connecting'
 
+    def start_engine(self, results, title, year, episode, runtime_minutes, any_audio):
+        """Plays through Stremio's streaming engine. Returns (hash, label, 'ready') once the film's first bytes are here.
+
+        The best few sources are opened at once and each is asked for the start of its file, which the player needs
+        first anyway. The best-ranked one plays if it delivers within RACE_PATIENCE_SECONDS; otherwise the best-ranked
+        of those that already have. A source that advertises seeders but sends nothing never wins.
+        """
+        tried = []
+        for result in ranked(results, title, year, episode, runtime_minutes, any_audio):
+            link = magnet_for(result, title)
+            hash_ = hash_from_magnet(link) if link else None
+            if hash_ and all(hash_ != h for _, h in tried):
+                tried.append((result, hash_))
+            if len(tried) == RACE_CANDIDATES:
+                break
+        if not tried:
+            raise LookupError('no source')
+        with self.lock:
+            for result, hash_ in tried:   # already playing here: no need to race
+                entry = self.known.get(hash_)
+                if entry and entry.get('engine') and self.same_file(entry, episode, result.get('fileIdx')):
+                    entry['seen'] = time.time()
+                    return hash_, entry['label'], 'ready'
+
+        began = time.time()
+        deadline = began + self.race_deadline
+        arrived, finished = {}, set()
+        signal = threading.Condition()
+
+        def attempt(i, result, hash_):
+            try:
+                files = self.engine.open(hash_, sources_for(result, hash_, TRACKERS), timeout=max(1.0, deadline - time.time()))
+                chosen = video_file(files, episode, result.get('fileIdx'))
+                if chosen is not None:
+                    seconds = self.engine.head_time(hash_, chosen[0], max(1, min(RACE_HEAD_BYTES, chosen[2])), deadline)
+                    if seconds is not None:
+                        with signal:
+                            arrived[i] = (seconds, chosen)
+            except EngineError as error:
+                LOG.info('engine source %d did not open: %s', i + 1, error)
+            finally:
+                with signal:
+                    finished.add(i)
+                    signal.notify_all()
+
+        for i, (result, hash_) in enumerate(tried):
+            threading.Thread(target=attempt, args=(i, result, hash_), daemon=True).start()
+        with signal:
+            while not (0 in arrived or len(finished) == len(tried) or time.time() >= deadline
+                       or (arrived and time.time() - began >= self.race_patience)):
+                signal.wait(0.1)
+            winner = min(arrived) if arrived else None
+        for i, (_, hash_) in enumerate(tried):
+            if i != winner and hash_ not in self.known:
+                self.engine.remove(hash_)
+        if winner is None:
+            raise LookupError('no source')   # none sent anything in time
+        result, hash_ = tried[winner]
+        seconds, (index, name, size) = arrived[winner]
+        entry = {'hash': hash_, 'engine': True, 'file_index': index, 'path': name, 'size': size,
+                 'label': re.sub(r'[\._]+', ' ', Path(name).stem)[:120], 'seen': time.time(),
+                 'advertised_seeders': result.get('seeders'), 'transcode': audio_unplayable(name)}
+        with self.lock:
+            self.known[hash_] = entry
+        LOG.info('engine: source %d of %d plays (first bytes in %.1fs, chosen after %.1fs)', winner + 1, len(tried),
+                 seconds, time.time() - began)
+        return hash_, entry['label'], 'ready'
+
+    @staticmethod
+    def same_file(entry, episode, file_idx):
+        if file_idx is not None:
+            return file_idx == entry.get('file_index')
+        return episode is None or bool(episode_marker(*episode).search(entry.get('path') or ''))
+
+    def refresh_end_pieces(self, hash_, row):
+        """Has qBittorrent fetch the selected file's first and last pieces first.
+
+        qBittorrent applies first/last-piece priority to the files selected when that setting was switched on, not to a
+        file selected later in a pack. A player reads the end of a Matroska file (its seek index) before it shows a
+        picture, so it would wait for the whole sequential download. Switching the setting off and on re-applies it.
+        qBittorrent applies a new file selection in the background, so it is done again a few seconds later as well.
+        """
+        def toggle(was_on):
+            try:
+                self.qbit('/api/v2/torrents/toggleFirstLastPiecePrio', {'hashes': hash_})
+                if was_on:
+                    self.qbit('/api/v2/torrents/toggleFirstLastPiecePrio', {'hashes': hash_})
+            except ServiceError as error:
+                LOG.warning('could not prioritise the file ends: %s', error)
+
+        toggle((row or {}).get('f_l_piece_prio', True))
+
+        def later():
+            for delay in self.end_piece_retries:
+                time.sleep(delay)
+                toggle(True)   # on after the first toggle, so off and on again
+        if self.end_piece_retries:
+            threading.Thread(target=later, daemon=True).start()
+
+    def switch_file(self, hash_, episode, file_idx):
+        """Serves another file of a torrent already here (the next episode in a pack), downloading only that file now."""
+        row = self.torrent(hash_)
+        files = self.qbit('/api/v2/torrents/files?hash=' + hash_) or []
+        if not row or not files:
+            raise ServiceError('this source is no longer available')
+        chosen = video_file(files, episode, file_idx)
+        if chosen is None:
+            raise LookupError('no video file')
+        index = chosen[0]
+        others = '|'.join(str(f['index']) for f in files if f['index'] != index)
+        if others:
+            self.qbit('/api/v2/torrents/filePrio', {'hash': hash_, 'id': others, 'priority': 0})
+        self.qbit('/api/v2/torrents/filePrio', {'hash': hash_, 'id': str(index), 'priority': 1})
+        self.refresh_end_pieces(hash_, row)
+        entry = self.entry_for(hash_, row['save_path'], files, chosen)
+        with self.lock:
+            entry['advertised_seeders'] = (self.known.get(hash_) or {}).get('advertised_seeders')
+            self.known[hash_] = entry
+        LOG.info('switched a pack to another of its files')
+        return entry
+
     def resolve(self, hash_):
         """Background: waits for the torrent's metadata, so the film can be served. A failure is kept for /status."""
         try:
@@ -682,6 +886,7 @@ class Streams:
             with self.lock:
                 if hash_ in self.pending:
                     self.pending[hash_]['error'] = str(error) or 'timed out'
+                    self.pending[hash_]['failed_at'] = time.monotonic()
             try:
                 if self.owns_torrent(self.torrent(hash_)):
                     self.qbit('/api/v2/torrents/delete', {'hashes': hash_, 'deleteFiles': 'true'})
@@ -714,36 +919,56 @@ class Streams:
                 return {'phase': 'failed', 'label': pending['label']}
             row = self.torrent(hash_) or {}
             return {'phase': 'connecting', 'label': pending['label'],
+                    'advertisedSeeds': pending.get('advertised_seeders'),
                     'seeds': row.get('num_seeds', 0), 'peers': row.get('num_leechs', 0),
                     'speed': row.get('dlspeed', 0)}
+        if entry.get('engine'):
+            try:
+                stats = self.engine.stats(hash_, entry['file_index'])
+            except EngineError:
+                stats = {}
+            progress = min(1.0, float(stats.get('streamProgress') or 0))
+            # The engine fetches whatever part is read next, so the player may seek anywhere (seekAnywhere).
+            return {'phase': 'ready', 'label': entry['label'], 'advertisedSeeds': entry.get('advertised_seeders'),
+                    'seeds': stats.get('unchoked', 0), 'peers': stats.get('peers', 0),
+                    'progress': round(progress, 4), 'torrentProgress': round(progress, 4),
+                    'bufferedBytes': int(progress * entry['size']), 'fileIdx': entry['file_index'],
+                    'speed': int(stats.get('downloadSpeed') or 0), 'size': entry['size'], 'seekAnywhere': True,
+                    'engine': 'stremio'}
         row = self.torrent(hash_) or {}
-        ready = self.downloaded_until(entry, 0) >= min(READY_BYTES, entry['size'])
+        contiguous = max(0, self.downloaded_until(entry, 0))
+        ready = contiguous >= min(READY_BYTES, entry['size'])
         # speed (bytes/s) and size (bytes of the film file) feed the player's loading screen and Stream card.
         return {'phase': 'ready' if ready else 'buffering', 'label': entry['label'],
+                'advertisedSeeds': entry.get('advertised_seeders'),
                 'seeds': row.get('num_seeds', 0), 'peers': row.get('num_leechs', 0),
-                'progress': round(row.get('progress', 0.0), 4),
-                'speed': row.get('dlspeed', 0), 'size': entry['size']}
+                'progress': round(contiguous / entry['size'], 4) if entry['size'] else 0,
+                'torrentProgress': round(row.get('progress', 0.0), 4), 'bufferedBytes': contiguous,
+                'fileIdx': entry.get('file_index'), 'speed': row.get('dlspeed', 0), 'size': entry['size']}
 
     def await_film(self, hash_):
         """Waits for metadata, then selects only the film file, so the download follows its pieces in order."""
         deadline = time.time() + START_TIMEOUT
         with self.lock:
             episode = (self.pending.get(hash_) or {}).get('episode')
+            file_idx = (self.pending.get(hash_) or {}).get('fileIdx')
         while time.time() < deadline:
             rows = self.qbit('/api/v2/torrents/info?category=' + self.category) or []
             row = next((r for r in rows if hash_ and r.get('hash') == hash_), None)
             if row is None and not hash_ and rows:
                 row = max(rows, key=lambda r: r.get('added_on', 0))
-            if row and row.get('state') not in ('metaDL', 'checkingResumeData'):
+            if row and not row.get('force_start'):
+                # Metadata fetching can itself be queued behind ordinary downloads.
+                self.qbit('/api/v2/torrents/setForceStart', {'hashes': hash_, 'value': 'true'})
+            if row and row.get('state') not in ('metaDL', 'forcedMetaDL', 'checkingResumeData'):
                 hash_ = row['hash']
                 # Start it now: qBittorrent's active-download limit would otherwise queue the film behind the library's downloads.
-                self.qbit('/api/v2/torrents/setForceStart', {'hashes': hash_, 'value': 'true'})
                 files = self.qbit('/api/v2/torrents/files?hash=' + hash_) or []
                 if not files:
                     # Right after the add, qBittorrent can report a state before it has the file list. Wait for it.
                     time.sleep(2)
                     continue
-                chosen = video_file(files, episode)
+                chosen = video_file(files, episode, file_idx)
                 if chosen is None:
                     raise LookupError('no video file')
                 index, name, size = chosen
@@ -751,6 +976,8 @@ class Streams:
                 if others:
                     self.qbit('/api/v2/torrents/filePrio', {'hash': hash_, 'id': others, 'priority': 0})
                 self.qbit('/api/v2/torrents/filePrio', {'hash': hash_, 'id': str(index), 'priority': 1})
+                if others:
+                    self.refresh_end_pieces(hash_, row)
                 entry = self.entry_for(hash_, row['save_path'], files, chosen)
                 self.known[hash_] = entry
                 return hash_, entry
@@ -763,6 +990,10 @@ class Streams:
         with self.lock:
             stale = [h for h, e in self.known.items() if now - e['seen'] > IDLE_SECONDS]
             for hash_ in stale:
+                if self.known[hash_].get('engine'):
+                    self.engine.remove(hash_)   # the engine keeps its own size-capped cache
+                    self.known.pop(hash_, None)
+                    continue
                 try:
                     if self.owns_torrent(self.torrent(hash_)):
                         self.qbit('/api/v2/torrents/delete', {'hashes': hash_, 'deleteFiles': 'true'})
@@ -971,6 +1202,9 @@ class Handler(BaseHTTPRequestHandler):
         if entry['transcode'] and not original:
             self.serve_transcoded(entry)
             return
+        if entry.get('engine'):
+            self.serve_engine(entry)
+            return
         total = entry['size']
         window = parse_range(self.headers.get('Range'), total)
         if window is None:
@@ -979,6 +1213,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         start, end = window
+        LOG.info('read %s: bytes %d-%d of %d (from %.1f%%)', hash_[:8], start, end, total, 100.0 * start / max(total, 1))
         partial = bool(self.headers.get('Range'))
         self.send_response(206 if partial else 200)
         self.send_header('Content-Type', 'video/x-matroska' if entry['path'].lower().endswith('.mkv') else 'video/mp4')
@@ -993,17 +1228,57 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass  # The viewer left, or the stream stalled; nothing to tell them.
 
+    def serve_engine(self, entry):
+        """Passes a read through to the streaming engine, which fetches those exact pieces first."""
+        url = self.server.streams.engine.url(entry['hash'], entry['file_index'])
+        asked = self.headers.get('Range')
+        LOG.info('read %s via engine: %s', entry['hash'][:8], asked or 'whole file')
+        request = urllib.request.Request(url, headers={'Range': asked} if asked else {})
+        try:
+            upstream = urllib.request.urlopen(request, timeout=STALL_SECONDS)
+        except urllib.error.HTTPError as error:
+            self.send_response(error.code)
+            for name in ('Content-Range', 'Content-Length'):
+                if error.headers.get(name):
+                    self.send_header(name, error.headers[name])
+            self.end_headers()
+            return
+        except (urllib.error.URLError, OSError):
+            self.reply(502, {'error': 'The streaming engine is not answering'})
+            return
+        with upstream:
+            self.send_response(upstream.status)
+            self.send_header('Content-Type', 'video/x-matroska' if entry['path'].lower().endswith('.mkv')
+                             else upstream.headers.get('Content-Type', 'video/mp4'))
+            for name in ('Content-Length', 'Content-Range', 'Accept-Ranges'):
+                if upstream.headers.get(name):
+                    self.send_header(name, upstream.headers[name])
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            try:
+                while True:
+                    chunk = upstream.read1(COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    entry['seen'] = time.time()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                pass  # The viewer left or seeked; the player opens a new read.
+
     def serve_transcoded(self, entry):
         """Serves the film as Matroska with AAC audio, for a TV that cannot decode the original soundtrack.
 
         ffmpeg reads from a pipe that this method fills with finished pieces only, and writes to the response.
         The result cannot be seeked, so it is served whole; the player can still play straight through.
         """
-        command = [FFMPEG, '-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+        engine = self.server.streams.engine if entry.get('engine') else None
+        source = engine.url(entry['hash'], entry['file_index']) if engine else 'pipe:0'
+        command = [FFMPEG, '-hide_banner', '-loglevel', 'error', '-i', source,
                    '-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
                    '-f', 'matroska', 'pipe:1']
         try:
-            ffmpeg = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            ffmpeg = subprocess.Popen(command, stdin=subprocess.DEVNULL if engine else subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except OSError:
             self.reply(503, {'error': 'Audio conversion is unavailable'})
             return
@@ -1012,8 +1287,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('Connection', 'close')
         self.end_headers()
-        feeder = threading.Thread(target=self.feed, args=(ffmpeg, entry), daemon=True)
-        feeder.start()
+        if not engine:   # ffmpeg reads the engine's address itself; a qBittorrent file is fed piece by piece
+            threading.Thread(target=self.feed, args=(ffmpeg, entry), daemon=True).start()
         try:
             while True:
                 chunk = ffmpeg.stdout.read(COPY_CHUNK_BYTES)
@@ -1063,6 +1338,7 @@ class Handler(BaseHTTPRequestHandler):
         path = Path(entry['path'])
         position, last_growth = start, time.time()
         handle = None
+        logged_wait = False
         streams = self.server.streams
         try:
             while position <= end:
@@ -1080,10 +1356,20 @@ class Handler(BaseHTTPRequestHandler):
                 except ServiceError:
                     available = 0
                 if available <= 0:
-                    if time.time() - last_growth > STALL_SECONDS:
+                    waited = time.time() - last_growth
+                    if waited > STALL_SECONDS:
+                        LOG.info('read %s: gave up waiting at byte %d after %ds', entry['hash'][:8], position, int(waited))
                         return
+                    if not logged_wait and waited > 3:
+                        logged_wait = True
+                        piece = (entry['offset'] + position) // entry['piece_size']
+                        LOG.info('read %s: waiting for piece %d (byte %d, %.1f%% of the file)', entry['hash'][:8], piece,
+                                 position, 100.0 * position / max(entry['size'], 1))
                     time.sleep(QUICK_POLL_SECONDS)
                     continue
+                if logged_wait:
+                    LOG.info('read %s: piece arrived after %.1fs', entry['hash'][:8], time.time() - last_growth)
+                    logged_wait = False
                 chunk = handle.read(min(available, end - position + 1, COPY_CHUNK_BYTES))
                 if not chunk:
                     time.sleep(QUICK_POLL_SECONDS)
@@ -1118,7 +1404,8 @@ def main():
                           qbit=config.qbit_url, qbit_username=config.qbit_username, qbit_password=config.qbit_password,
                           seerr=config.seerr_url, host_media=config.media_root, qbit_media=config.qbit_media_root,
                           tickets=tickets, category=config.category,
-                          addons=ADDONS if config.addons is None else config.addons)
+                          addons=ADDONS if config.addons is None else config.addons,
+                          engine=StremioEngine(config.stremio_server) if config.stremio_server else None)
     except (ValueError, OSError) as error:
         parser.exit(2, f'Configuration error: {error}\n')
 
