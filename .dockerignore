@@ -5,3 +5,5 @@
 !configuration.py
 !playback.py
 !LICENSE
+!engine.py
+!voice.py
