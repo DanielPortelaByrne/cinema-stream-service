@@ -833,10 +833,15 @@ class Streams:
         deadline = began + self.race_deadline
         arrived, started, finished = {}, {}, set()   # arrived: start (and end, when needed); started: the start alone
         signal = threading.Condition()
+        settled_flag = threading.Event()   # set once a winner is chosen: sources still in flight then are dropped, not kept
 
         def attempt(i, result, hash_):
             try:
                 files = self.engine.open(hash_, sources_for(result, hash_, TRACKERS), timeout=max(1.0, deadline - time.time()))
+                if settled_flag.is_set():
+                    # Opened after the race was decided: the engine would otherwise keep it, and its peers, running.
+                    self.engine.remove(hash_)
+                    return
                 chosen = video_file(files, episode, result.get('fileIdx'))
                 if chosen is not None:
                     index, name, size = chosen
@@ -877,6 +882,7 @@ class Streams:
             if winner is not None and winner not in arrived:
                 arrived[winner] = started[winner]
                 LOG.info('no source sent its end in time; playing source %d without it', winner + 1)
+        settled_flag.set()
         for i, (_, hash_) in enumerate(tried):
             if i != winner and hash_ not in self.known:
                 self.engine.remove(hash_)

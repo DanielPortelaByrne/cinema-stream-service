@@ -18,6 +18,7 @@ FILM = bytes(range(256)) * 16384   # 4 MiB
 class FakeEngine(BaseHTTPRequestHandler):
     """Stremio's server, cut down: create, ranged file reads, stats, remove. DEAD never sends a byte; SLOW is late."""
     created, removed, ranges, gone = [], [], [], set()
+    slow_open = {}
 
     def log_message(self, *_):
         pass
@@ -29,6 +30,8 @@ class FakeEngine(BaseHTTPRequestHandler):
     def do_POST(self):
         hash_ = self.path.split('/')[1]
         FakeEngine.created.append((hash_, json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+        if hash_ in FakeEngine.slow_open:
+            time.sleep(FakeEngine.slow_open[hash_])
         self.answer({'files': [{'name': 'Extras.mkv', 'length': 1000},
                                {'name': 'Show.S01E05.1080p.mkv', 'length': len(FILM)}]})
 
@@ -59,6 +62,7 @@ class FakeEngine(BaseHTTPRequestHandler):
 class EngineTests(LocalServerTests):
     def setUp(self):
         FakeEngine.created, FakeEngine.removed, FakeEngine.ranges, FakeEngine.gone = [], [], [], set()
+        FakeEngine.slow_open = {}
         _, self.engine_base = self.serve(FakeEngine)
         self.streams = svc.Streams(host_media=self.temporary(), addons=(), engine=StremioEngine(self.engine_base))
         self.streams.searches.get = lambda *args: []
@@ -131,6 +135,15 @@ class EngineTests(LocalServerTests):
         hash_, _, _ = self.streams.start('Show', None, (1, 5), candidates=[self.candidate(NOEND, 900)])
         self.assertEqual(hash_, NOEND)
         self.assertLess(time.time() - began, 5)
+
+    def test_a_source_still_opening_after_the_race_is_removed_not_kept(self):
+        slow = 'e' * 40
+        FakeEngine.slow_open = {slow: 1.5}
+        hash_, _, _ = self.streams.start('Show', None, (1, 5), candidates=[self.candidate(LIVE, 40), self.candidate(slow, 400, '2160p')])
+        self.assertEqual(hash_, LIVE)
+        time.sleep(2.2)
+        self.assertIn(slow, FakeEngine.removed)
+        FakeEngine.slow_open = {}
 
     def test_status_survives_a_torrent_the_engine_dropped(self):
         self.streams.start('Show', None, (1, 5), candidates=[self.candidate(LIVE, 40)])
