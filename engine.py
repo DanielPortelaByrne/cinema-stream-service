@@ -58,6 +58,22 @@ class StremioEngine:
     def url(self, info_hash, file_idx):
         return f'{self.base}/{info_hash}/{int(file_idx)}'
 
+    def fetch(self, info_hash, file_idx, start, end, timeout):
+        """Reads bytes [start, end] of a file and throws them away, so the engine has them (and stays busy) before the
+        player asks. True when they all arrived."""
+        request = urllib.request.Request(self.url(info_hash, file_idx), headers={'Range': f'bytes={start}-{end}'})
+        want, got, began = end - start + 1, 0, time.time()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                while got < want and time.time() - began < timeout:
+                    chunk = response.read1(256 * 1024)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+        return got >= want
+
     def head_time(self, info_hash, file_idx, length, deadline):
         """Reads the first [length] bytes of a file; seconds it took, or None if it did not arrive by [deadline]."""
         started = time.time()

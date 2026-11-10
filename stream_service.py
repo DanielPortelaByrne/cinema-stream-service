@@ -59,10 +59,28 @@ COPY_CHUNK_BYTES = 256 * 1024   # small enough to start sending sooner, large en
 READY_BYTES = 16 * 1024 * 1024  # how much must be ready before the loading screen hands over to playback
 FFMPEG = shutil.which('ffmpeg') or '/usr/bin/ffmpeg'
 IDLE_SECONDS = 4 * 3600     # an unwatched stream is removed after this long
-RACE_CANDIDATES = 3          # the best sources tried at once in the streaming engine; the first to deliver plays
+# Seeder counts say little about how fast a source sends its first bytes: on the Deck the best-ranked source was often
+# the slowest, and a lower-ranked one delivered in under two seconds. So more sources race, and the best-ranked one
+# only gets a short head start.
+RACE_CANDIDATES = 6          # the best sources tried at once in the streaming engine; the first to deliver plays
 RACE_HEAD_BYTES = 2 * 1024 * 1024   # what each must deliver to count as alive (the player needs it first anyway)
-RACE_PATIENCE_SECONDS = 4    # how long the best-ranked source gets before a faster lower-ranked one is taken
+# A Matroska file's seek index sits at its end, and the player reads it before the first frame. On a thinly seeded
+# torrent the end can take far longer than the start (or never come), so for those files a source must deliver both.
+RACE_TAIL_BYTES = 1024 * 1024
+RACE_TAIL_PATIENCE_SECONDS = 6   # once a source has its start, how long to wait for one with its end as well
+RACE_PATIENCE_SECONDS = 1.5  # how long the best-ranked source gets before a faster lower-ranked one is taken
 RACE_DEADLINE_SECONDS = 30   # no source delivered by then: none of them is playable now
+# What a player reads before its first frame, fetched as soon as a stream is chosen so it is already here on Play: the
+# file's end (Matroska's seek index, an MP4's index when it is not at the front), then its opening stretch.
+PRIME_TAIL_BYTES = 4 * 1024 * 1024
+PRIME_HEAD_BYTES = 24 * 1024 * 1024
+PRIME_SECONDS = 60
+# The engine pauses a torrent nobody reads after 20 s and drops it after 2 minutes. A stream started ahead of Play (the
+# TV does this once the viewer rests on a page) is kept busy with a one-byte read this often, for this long, so it is
+# still warm, and still downloading ahead, when Play is pressed. Only the newest few are kept warm at once.
+HOLD_EVERY_SECONDS = 10
+HOLD_SECONDS = 5 * 60
+HOLD_MAX = 2
 END_PIECE_RETRY_SECONDS = (2, 4, 8)  # re-apply first/last-piece priority after qBittorrent applies a file selection
 START_TIMEOUT = 90         # waiting for qBittorrent to fetch torrent metadata
 SEARCH_TTL = 20 * 60        # a search answer is reused this long (a /prepare, then the /start that follows it)
@@ -485,6 +503,8 @@ class Streams:
         # Stremio's streaming server, when set up: streams play through it; qBittorrent is then only the fallback.
         self.engine = engine
         self.race_patience, self.race_deadline = RACE_PATIENCE_SECONDS, RACE_DEADLINE_SECONDS
+        self.prime_tail, self.prime_head = PRIME_TAIL_BYTES, PRIME_HEAD_BYTES
+        self.race_tail, self.race_tail_patience = RACE_TAIL_BYTES, RACE_TAIL_PATIENCE_SECONDS
         self.category = category
         self.addons, self.cinemeta = tuple(addons), cinemeta
         self.prowlarr_api_key = prowlarr_api_key
@@ -772,15 +792,27 @@ class Streams:
         if not tried:
             raise LookupError('no source')
         with self.lock:
+            reuse = None
             for result, hash_ in tried:   # already playing here: no need to race
                 entry = self.known.get(hash_)
                 if entry and entry.get('engine') and self.same_file(entry, episode, result.get('fileIdx')):
-                    entry['seen'] = time.time()
-                    return hash_, entry['label'], 'ready'
+                    reuse = hash_, entry
+                    break
+        if reuse is not None:
+            hash_, entry = reuse
+            # Only while the engine still has it: it drops a torrent nobody has read for two minutes, and saying "ready"
+            # for one it dropped leaves the player waiting while it is fetched again from scratch.
+            if self.engine_has(hash_, entry['file_index']):
+                entry['seen'] = time.time()
+                entry['hold_until'] = time.time() + HOLD_SECONDS
+                return hash_, entry['label'], 'ready'
+            LOG.info('engine had dropped %s; starting it again', hash_[:8])
+            with self.lock:
+                self.known.pop(hash_, None)
 
         began = time.time()
         deadline = began + self.race_deadline
-        arrived, finished = {}, set()
+        arrived, started, finished = {}, {}, set()   # arrived: start (and end, when needed); started: the start alone
         signal = threading.Condition()
 
         def attempt(i, result, hash_):
@@ -788,8 +820,16 @@ class Streams:
                 files = self.engine.open(hash_, sources_for(result, hash_, TRACKERS), timeout=max(1.0, deadline - time.time()))
                 chosen = video_file(files, episode, result.get('fileIdx'))
                 if chosen is not None:
-                    seconds = self.engine.head_time(hash_, chosen[0], max(1, min(RACE_HEAD_BYTES, chosen[2])), deadline)
+                    index, name, size = chosen
+                    seconds = self.engine.head_time(hash_, index, max(1, min(RACE_HEAD_BYTES, size)), deadline)
                     if seconds is not None:
+                        with signal:
+                            started[i] = (seconds, chosen)
+                            signal.notify_all()
+                        if self.race_tail and name.lower().endswith('.mkv') and size > 2 * self.race_tail:
+                            if not self.engine.fetch(hash_, index, size - self.race_tail, size - 1, max(1.0, deadline - time.time())):
+                                return
+                            seconds = time.time() - began
                         with signal:
                             arrived[i] = (seconds, chosen)
             except EngineError as error:
@@ -799,13 +839,25 @@ class Streams:
                     finished.add(i)
                     signal.notify_all()
 
+        def settled():
+            now = time.time()
+            if 0 in arrived or len(finished) == len(tried) or now >= deadline:
+                return True
+            if arrived and now - began >= self.race_patience:
+                return True
+            # Starts have come but no end yet: do not hold Play for an end that may never come.
+            first_start = min((s for s, _ in started.values()), default=None)
+            return first_start is not None and now - began >= max(self.race_patience, first_start + self.race_tail_patience)
+
         for i, (result, hash_) in enumerate(tried):
             threading.Thread(target=attempt, args=(i, result, hash_), daemon=True).start()
         with signal:
-            while not (0 in arrived or len(finished) == len(tried) or time.time() >= deadline
-                       or (arrived and time.time() - began >= self.race_patience)):
+            while not settled():
                 signal.wait(0.1)
-            winner = min(arrived) if arrived else None
+            winner = min(arrived) if arrived else (min(started) if started else None)
+            if winner is not None and winner not in arrived:
+                arrived[winner] = started[winner]
+                LOG.info('no source sent its end in time; playing source %d without it', winner + 1)
         for i, (_, hash_) in enumerate(tried):
             if i != winner and hash_ not in self.known:
                 self.engine.remove(hash_)
@@ -815,12 +867,42 @@ class Streams:
         seconds, (index, name, size) = arrived[winner]
         entry = {'hash': hash_, 'engine': True, 'file_index': index, 'path': name, 'size': size,
                  'label': re.sub(r'[\._]+', ' ', Path(name).stem)[:120], 'seen': time.time(),
-                 'advertised_seeders': result.get('seeders'), 'transcode': audio_unplayable(name)}
+                 'advertised_seeders': result.get('seeders'), 'transcode': audio_unplayable(name),
+                 'hold_until': time.time() + HOLD_SECONDS}
         with self.lock:
             self.known[hash_] = entry
+        threading.Thread(target=self.prime, args=(hash_,), daemon=True).start()
         LOG.info('engine: source %d of %d plays (first bytes in %.1fs, chosen after %.1fs)', winner + 1, len(tried),
                  seconds, time.time() - began)
         return hash_, entry['label'], 'ready'
+
+    def engine_has(self, hash_, file_idx):
+        """Whether the streaming engine still holds this torrent (its stats are empty once it has dropped it)."""
+        try:
+            return bool(self.engine.stats(hash_, file_idx))
+        except EngineError:
+            return False
+
+    def prime(self, hash_):
+        """Fetches what the player reads before its first frame, so Play finds it here: the file's end, then its opening."""
+        entry = self.known.get(hash_)
+        if not entry or not entry.get('engine'):
+            return
+        size, index, began = entry['size'], entry['file_index'], time.time()
+        if self.prime_tail and size > 2 * self.prime_tail:
+            self.engine.fetch(hash_, index, size - self.prime_tail, size - 1, PRIME_SECONDS)
+        if self.prime_head:
+            self.engine.fetch(hash_, index, 0, min(self.prime_head, size) - 1, PRIME_SECONDS)
+        LOG.info('primed %s (end and opening) in %.1fs', hash_[:8], time.time() - began)
+
+    def hold_tick(self):
+        """Keeps the newest streams started ahead of Play warm: a one-byte read stops the engine pausing or dropping them."""
+        now = time.time()
+        with self.lock:
+            warm = sorted(((e['hold_until'], h, e['file_index']) for h, e in self.known.items()
+                           if e.get('engine') and e.get('hold_until', 0) > now), reverse=True)[:HOLD_MAX]
+        for _, hash_, index in warm:
+            self.engine.fetch(hash_, index, 0, 0, 5)
 
     @staticmethod
     def same_file(entry, episode, file_idx):
@@ -924,7 +1006,8 @@ class Streams:
                     'speed': row.get('dlspeed', 0)}
         if entry.get('engine'):
             try:
-                stats = self.engine.stats(hash_, entry['file_index'])
+                # Empty (null) once the engine has dropped the torrent: report nothing rather than fail the request.
+                stats = self.engine.stats(hash_, entry['file_index']) or {}
             except EngineError:
                 stats = {}
             progress = min(1.0, float(stats.get('streamProgress') or 0))
@@ -1424,6 +1507,17 @@ def main():
             streams.sweep()
 
     threading.Thread(target=housekeeping, daemon=True).start()
+
+    def holding():
+        while True:
+            time.sleep(HOLD_EVERY_SECONDS)
+            try:
+                streams.hold_tick()
+            except Exception:   # noqa: BLE001 - keeping streams warm must never stop the service
+                LOG.warning('keeping streams warm failed', exc_info=True)
+
+    if streams.engine is not None:
+        threading.Thread(target=holding, daemon=True).start()
     server = LimitedServer((config.listen_host, config.port), Handler)
     server.streams = streams
     if config.seerr_api_key and config.voice_token:

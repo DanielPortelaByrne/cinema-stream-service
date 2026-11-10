@@ -11,13 +11,13 @@ from engine import StremioEngine, sources_for
 from test_standalone import LocalServerTests
 import stream_service as svc
 
-LIVE, DEAD, SLOW = 'a' * 40, 'b' * 40, 'c' * 40
+LIVE, DEAD, SLOW, NOEND = 'a' * 40, 'b' * 40, 'c' * 40, 'd' * 40
 FILM = bytes(range(256)) * 16384   # 4 MiB
 
 
 class FakeEngine(BaseHTTPRequestHandler):
     """Stremio's server, cut down: create, ranged file reads, stats, remove. DEAD never sends a byte; SLOW is late."""
-    created, removed, ranges = [], [], []
+    created, removed, ranges, gone = [], [], [], set()
 
     def log_message(self, *_):
         pass
@@ -37,11 +37,15 @@ class FakeEngine(BaseHTTPRequestHandler):
         if parts[-1] == 'remove':
             FakeEngine.removed.append(parts[0]); return self.answer({})
         if parts[-1] == 'stats.json':
+            if parts[0] in FakeEngine.gone:   # Stremio answers null for a torrent it has dropped
+                return self.answer(None)
             return self.answer({'peers': 9, 'unchoked': 4, 'downloadSpeed': 2_000_000, 'streamProgress': 0.25})
         if parts[0] == DEAD:
             time.sleep(3); return
         if parts[0] == SLOW:
             time.sleep(0.6)
+        if parts[0] == NOEND and not self.headers['Range'].startswith('bytes=0-'):
+            time.sleep(3); return   # its start arrives, its end never does
         FakeEngine.ranges.append(self.headers.get('Range'))
         start, end = map(int, re.fullmatch(r'bytes=(\d+)-(\d+)', self.headers['Range']).groups())
         end = min(end, len(FILM) - 1)
@@ -54,11 +58,12 @@ class FakeEngine(BaseHTTPRequestHandler):
 
 class EngineTests(LocalServerTests):
     def setUp(self):
-        FakeEngine.created, FakeEngine.removed, FakeEngine.ranges = [], [], []
+        FakeEngine.created, FakeEngine.removed, FakeEngine.ranges, FakeEngine.gone = [], [], [], set()
         _, self.engine_base = self.serve(FakeEngine)
         self.streams = svc.Streams(host_media=self.temporary(), addons=(), engine=StremioEngine(self.engine_base))
         self.streams.searches.get = lambda *args: []
         self.streams.race_patience, self.streams.race_deadline = 1.5, 5
+        self.streams.prime_tail = self.streams.prime_head = 0   # priming is tested on its own: off, it cannot race other reads
 
     def candidate(self, hash_, seeders, quality='1080p'):
         return {'title': f'Show.S01E05.{quality}.WEB-DL', 'infoHash': hash_, 'seeders': seeders, 'size': 1024 ** 3,
@@ -114,6 +119,56 @@ class EngineTests(LocalServerTests):
             self.assertEqual(response.headers['Content-Range'], f'bytes 4000000-4000099/{len(FILM)}')
             self.assertEqual(response.read(), FILM[4000000:4000100])
         self.assertEqual(FakeEngine.ranges[-1], 'bytes=4000000-4000099')
+
+    def test_a_source_whose_end_never_comes_loses_to_one_that_sends_both(self):
+        hash_, _, _ = self.streams.start('Show', None, (1, 5), candidates=[
+            self.candidate(NOEND, 900, '2160p'), self.candidate(LIVE, 20, '720p')])
+        self.assertEqual(hash_, LIVE)
+
+    def test_with_no_end_anywhere_the_best_start_still_plays_without_waiting_out_the_race(self):
+        self.streams.race_tail_patience, self.streams.race_deadline = 0.5, 20
+        began = time.time()
+        hash_, _, _ = self.streams.start('Show', None, (1, 5), candidates=[self.candidate(NOEND, 900)])
+        self.assertEqual(hash_, NOEND)
+        self.assertLess(time.time() - began, 5)
+
+    def test_status_survives_a_torrent_the_engine_dropped(self):
+        self.streams.start('Show', None, (1, 5), candidates=[self.candidate(LIVE, 40)])
+        FakeEngine.gone.add(LIVE)
+        status = self.streams.status(LIVE)
+        self.assertEqual((status['phase'], status['seeds'], status['speed']), ('ready', 0, 0))
+
+    def test_a_stream_the_engine_dropped_is_started_again_not_reported_ready(self):
+        self.streams.start('Show', None, (1, 5), candidates=[self.candidate(LIVE, 40)])
+        FakeEngine.gone.add(LIVE)
+        FakeEngine.created.clear()
+        self.assertEqual(self.streams.start('Show', None, (1, 5), candidates=[self.candidate(LIVE, 40)])[0], LIVE)
+        self.assertEqual([h for h, _ in FakeEngine.created], [LIVE])
+
+    def test_a_chosen_stream_fetches_its_end_and_opening_before_the_player_asks(self):
+        self.streams.prime_tail, self.streams.prime_head = 1024 * 1024, 2 * 1024 * 1024
+        self.streams.start('Show', None, (1, 5), candidates=[self.candidate(LIVE, 40)])
+        tail = f'bytes={len(FILM) - 1024 * 1024}-{len(FILM) - 1}'
+        head = f'bytes=0-{2 * 1024 * 1024 - 1}'
+        for _ in range(50):
+            if tail in FakeEngine.ranges and FakeEngine.ranges.count(head) >= 2:
+                break
+            time.sleep(0.05)
+        self.assertIn(tail, FakeEngine.ranges)
+        self.assertLess(FakeEngine.ranges.index(tail), len(FakeEngine.ranges) - 1 - FakeEngine.ranges[::-1].index(head))
+
+    def test_only_the_newest_unplayed_streams_are_kept_warm_and_only_for_a_while(self):
+        for hash_ in (LIVE, SLOW):
+            self.streams.start('Show', None, (1, 5), candidates=[self.candidate(hash_, 40)])
+        self.streams.known[SLOW]['file_index'] = 1
+        FakeEngine.ranges.clear()
+        self.streams.hold_tick()
+        self.assertEqual(FakeEngine.ranges.count('bytes=0-0'), 2)
+        for entry in self.streams.known.values():
+            entry['hold_until'] = time.time() - 1
+        FakeEngine.ranges.clear()
+        self.streams.hold_tick()
+        self.assertEqual(FakeEngine.ranges, [])
 
     def test_idle_streams_are_removed_from_the_engine(self):
         self.streams.start('Show', None, (1, 5), candidates=[self.candidate(LIVE, 40)])
