@@ -146,7 +146,14 @@ def clean_candidates(raw):
 
 
 def normalize(text):
-    return re.sub(r'[^a-z0-9]+', ' ', (text or '').lower()).strip()
+    # An apostrophe joins rather than splits: "Child's" matches a release's "Childs".
+    return re.sub(r'[^a-z0-9]+', ' ', re.sub(r"['’]", '', (text or '').lower())).strip()
+
+
+def main_title(title):
+    """A title without its subtitle ("Lemora" for "Lemora: A Child's Tale of the Supernatural"), or None."""
+    short = re.split(r'\s*[:–—]\s+|\s+-\s+', title or '')[0].strip()
+    return short if short and short != title and len(short) >= 4 else None
 
 
 def parse_release(name):
@@ -170,10 +177,14 @@ def episode_marker(season, episode):
 
 
 def title_matches(title, year, release):
-    """Every word of the film's title must appear in the release name, and a year, if given, must too."""
-    words = normalize(title).split()
+    """Every word of the film's title must appear in the release name, and a year, if given, must too. Releases often
+    leave a subtitle out, so the main title alone is enough when the year is there to tell it from other films."""
     haystack = ' ' + normalize(release) + ' '
-    if not words or any(' ' + w + ' ' not in haystack for w in words):
+
+    def has(name):
+        words = normalize(name).split()
+        return bool(words) and all(' ' + w + ' ' in haystack for w in words)
+    if not has(title) and not (year and main_title(title) and has(main_title(title))):
         return False
     if year and not re.search(r'(?<!\d)%d(?!\d)' % int(year), release):
         return False
@@ -194,6 +205,17 @@ def show_title_is(title, release):
 
 
 PACK_EPISODES = 10   # a season pack's size is shared out over about this many episodes when judging its bitrate
+
+
+def search_texts(title, year, episode=None):
+    """What the indexers are asked. An episode is also looked for in its season's pack, which is how older series are
+    mostly shared (a search for "S01E01" alone found nothing for many of them). A long title is also asked by its main
+    name ("Lemora" for "Lemora: A Child's Tale of the Supernatural"), as releases often leave the subtitle out."""
+    names = [title] + ([main_title(title)] if main_title(title) else [])
+    if episode is None:
+        return [f'{n} {year}' if year else n for n in names]
+    season, number = int(episode[0]), int(episode[1])
+    return [f'{n} S{season:02d}E{number:02d}' for n in names] + [f'{n} S{season:02d}' for n in names]
 
 
 def season_pack(name, season):
@@ -534,10 +556,7 @@ class Streams:
         key = self.prowlarr_api_key
         if not key:
             raise ServiceError('Prowlarr API key is not configured')
-        if episode is None:
-            text, category = (f'{title} {year}' if year else title), MOVIE_CATEGORY
-        else:
-            text, category = f'{title} S{int(episode[0]):02d}E{int(episode[1]):02d}', TV_CATEGORY
+        texts, category = search_texts(title, year, episode), (MOVIE_CATEGORY if episode is None else TV_CATEGORY)
         headers = {'X-Api-Key': key, 'Accept': 'application/json'}
         try:
             with urllib.request.urlopen(urllib.request.Request(f'{self.prowlarr}/api/v1/indexer', headers=headers), timeout=10) as response:
@@ -548,7 +567,7 @@ class Streams:
 
         # Each indexer is asked on its own and all at once. One that is slow or failing is skipped, so it cannot hold up
         # the answers from the rest (Prowlarr otherwise waits for every indexer before it replies).
-        def ask(indexer):
+        def ask(indexer, text):
             query = urllib.parse.urlencode({'query': text, 'type': 'search', 'categories': category, 'limit': 100, 'indexerIds': indexer})
             req = urllib.request.Request(f'{self.prowlarr}/api/v1/search?{query}', headers=headers)
             with urllib.request.urlopen(req, timeout=INDEXER_SECONDS) as response:
@@ -557,11 +576,11 @@ class Streams:
         def ask_addon(base):
             return addon_results(base, title, year, episode, self.cinemeta)
 
-        workers = len(indexers) + len(self.addons)
+        workers = len(indexers) * len(texts) + len(self.addons)
         if not workers:
             raise ServiceError('indexers unavailable')
         pool = ThreadPoolExecutor(max_workers=workers)
-        asked = {pool.submit(ask, i): f'indexer {i}' for i in indexers}
+        asked = {pool.submit(ask, i, text): f'indexer {i} ({text})' for i in indexers for text in texts}
         asked.update({pool.submit(ask_addon, base): base for base in self.addons})
         done, late = wait(asked, timeout=SEARCH_SECONDS)
         pool.shutdown(wait=False, cancel_futures=True)

@@ -30,6 +30,13 @@ class SelectionRules(unittest.TestCase):
         self.assertEqual(svc.acceptable(release('Heat 1995 HDCAM x264'), 'Heat', 1995)[1], 'poor copy')
         self.assertEqual(svc.acceptable(release('Heat 1995 TELESYNC'), 'Heat', 1995)[1], 'poor copy')
 
+    def test_a_release_may_leave_out_the_subtitle_when_the_year_is_there(self):
+        title = "Lemora: A Child's Tale of the Supernatural"
+        self.assertTrue(svc.title_matches(title, 1973, 'Lemora 1973 1080p BluRay x264'))
+        self.assertTrue(svc.title_matches(title, 1973, 'Lemora.A.Childs.Tale.of.the.Supernatural.1973.720p'))
+        self.assertFalse(svc.title_matches(title, 1973, 'Lemora 2019 1080p'))
+        self.assertFalse(svc.title_matches(title, None, 'Lemora 1080p'))   # no year: the main title alone is too loose
+
     def test_rejects_other_films_and_series_packs(self):
         self.assertFalse(svc.acceptable(release('Heat 1995 1080p'), 'Heat', 2001)[0])  # year mismatch
         self.assertFalse(svc.acceptable(release('Heat 1995 1080p'), 'Ronin', 1998)[0])  # title mismatch

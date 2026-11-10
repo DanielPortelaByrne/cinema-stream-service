@@ -128,7 +128,7 @@ class Search(unittest.TestCase):
 
     def setUp(self):
         svc.imdb_ids.clear()
-        self.asked = []
+        self.asked, self.queries = [], []
         outer = self
 
         class Prowlarr(BaseHTTPRequestHandler):
@@ -138,8 +138,10 @@ class Search(unittest.TestCase):
                 if self.path.startswith('/api/v1/indexer'):
                     respond(self, [{'id': 1, 'enable': True}, {'id': 2, 'enable': True}, {'id': 3, 'enable': False}])
                     return
-                ids = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)['indexerIds']
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                ids = query['indexerIds']
                 outer.asked.append(ids[0])
+                outer.queries.append(query['query'][0])
                 if ids == ['2']:
                     respond(self, {}, 500)
                 else:
@@ -155,6 +157,16 @@ class Search(unittest.TestCase):
         found = self.streams(addons=()).search('Heat', 1995)
         self.assertEqual(sorted(self.asked), ['1', '2'])
         self.assertEqual([r['title'] for r in found], ['Heat 1995 1080p BluRay'])
+
+    def test_an_episode_is_also_looked_for_in_its_seasons_pack(self):
+        self.streams(addons=()).search('Darkplace', 2004, (1, 2))
+        self.assertEqual(sorted(set(self.queries)), ['Darkplace S01', 'Darkplace S01E02'])
+
+    def test_a_long_title_is_also_asked_by_its_main_name(self):
+        self.streams(addons=()).search("Lemora: A Child's Tale of the Supernatural", 1973)
+        self.assertIn('Lemora 1973', self.queries)
+        self.assertIn("Lemora: A Child's Tale of the Supernatural 1973", self.queries)
+        self.assertEqual(svc.search_texts('Heat', 1995), ['Heat 1995'])
 
     def test_add_on_streams_join_the_indexer_results(self):
         fake = FakeStremio(self, [{'infoHash': H1, 'title': 'Heat.1995.2160p\n\U0001F464 99 \U0001F4BE 9 GB'}])
