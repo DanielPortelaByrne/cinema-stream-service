@@ -19,6 +19,7 @@ class FakeEngine(BaseHTTPRequestHandler):
     """Stremio's server, cut down: create, ranged file reads, stats, remove. DEAD never sends a byte; SLOW is late."""
     created, removed, ranges, gone = [], [], [], set()
     slow_open = {}
+    listing = {}
 
     def log_message(self, *_):
         pass
@@ -39,6 +40,8 @@ class FakeEngine(BaseHTTPRequestHandler):
         parts = self.path.strip('/').split('/')
         if parts[-1] == 'remove':
             FakeEngine.removed.append(parts[0]); return self.answer({})
+        if self.path == '/stats.json':
+            return self.answer(FakeEngine.listing)
         if parts[-1] == 'stats.json':
             if parts[0] in FakeEngine.gone:   # Stremio answers null for a torrent it has dropped
                 return self.answer(None)
@@ -62,7 +65,7 @@ class FakeEngine(BaseHTTPRequestHandler):
 class EngineTests(LocalServerTests):
     def setUp(self):
         FakeEngine.created, FakeEngine.removed, FakeEngine.ranges, FakeEngine.gone = [], [], [], set()
-        FakeEngine.slow_open = {}
+        FakeEngine.slow_open, FakeEngine.listing = {}, {}
         _, self.engine_base = self.serve(FakeEngine)
         self.streams = svc.Streams(host_media=self.temporary(), addons=(), engine=StremioEngine(self.engine_base))
         self.streams.searches.get = lambda *args: []
@@ -144,6 +147,15 @@ class EngineTests(LocalServerTests):
         time.sleep(2.2)
         self.assertIn(slow, FakeEngine.removed)
         FakeEngine.slow_open = {}
+
+    def test_a_restart_adopts_the_streams_the_engine_still_holds(self):
+        FakeEngine.listing = {LIVE: {'files': [{'path': 'Show/readme.txt', 'length': 90},
+                                                {'path': 'Show/Show.S01E05.1080p.mkv', 'length': 3 * len(FILM)}]}}
+        self.streams.adopt_engine()
+        entry = self.streams.known[LIVE]
+        self.assertEqual((entry['engine'], entry['file_index'], entry['size']), (True, 1, 3 * len(FILM)))
+        self.assertTrue(entry['path'].endswith('Show.S01E05.1080p.mkv'))
+        FakeEngine.listing = {}
 
     def test_status_survives_a_torrent_the_engine_dropped(self):
         self.streams.start('Show', None, (1, 5), candidates=[self.candidate(LIVE, 40)])

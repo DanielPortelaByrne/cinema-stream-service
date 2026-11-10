@@ -666,6 +666,31 @@ class Streams:
             if chosen is None:
                 continue
             self.known[row['hash']] = self.entry_for(row['hash'], row['save_path'], files, chosen)
+        self.adopt_engine()
+
+    def adopt_engine(self):
+        """After a restart, adopts the streams the streaming engine still holds, so a paused film resumes and the engine
+        is swept as before. The largest video file of each torrent is taken as the film (the one a stream chose)."""
+        if self.engine is None:
+            return
+        try:
+            held = self.engine.torrents()
+        except EngineError:
+            LOG.warning('streaming engine unavailable at startup; its streams will be started again when asked for')
+            return
+        for hash_, files in held.items():
+            if hash_ in self.known or not re.fullmatch(r'[0-9a-f]{40}', hash_):
+                continue
+            videos = [(f['length'], i, f) for i, f in enumerate(files)
+                      if f['path'].lower().endswith(VIDEO_EXTENSIONS) and f['length'] > 0]
+            if not videos:
+                continue
+            _, index, f = max(videos)
+            name = f['path']
+            self.known[hash_] = {'hash': hash_, 'engine': True, 'file_index': index, 'path': name, 'size': f['length'],
+                                 'label': re.sub(r'[\._]+', ' ', Path(name).stem)[:120], 'seen': time.time(),
+                                 'advertised_seeders': None, 'transcode': audio_unplayable(name), 'hold_until': 0}
+            LOG.info('adopted %s from the engine (%s)', hash_[:8], name[-60:])
 
     def entry_for(self, hash_, save_path, files, chosen):
         """What the server needs to serve one film: where it is, how big, and where it sits among the torrent's pieces."""

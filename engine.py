@@ -46,6 +46,13 @@ class StremioEngine:
         return [{'index': i, 'name': f.get('name') or '', 'path': f.get('path') or '', 'size': int(f.get('length') or 0)}
                 for i, f in enumerate(files)]
 
+    def torrents(self):
+        """Every torrent the engine holds: {info_hash: [file paths and lengths in the engine's order]}."""
+        listing = self._json('/stats.json', timeout=5)
+        return {h: [{'path': f.get('path') or f.get('name') or '', 'length': int(f.get('length') or 0)}
+                    for f in (t.get('files') or [])]
+                for h, t in listing.items() if isinstance(t, dict)}
+
     def stats(self, info_hash, file_idx):
         return self._json(f'/{info_hash}/{int(file_idx)}/stats.json', timeout=5)
 
